@@ -72,6 +72,8 @@ pub struct ClientCaller<T> {
     auth_client: AuthClient,
     auth_token: AuthToken,
     options: CallOptions,
+    #[cfg(feature = "failover")]
+    retry: crate::failover::RetryConfig,
 }
 
 impl<T> ClientCaller<T> {
@@ -87,7 +89,17 @@ impl<T> ClientCaller<T> {
             auth_client,
             auth_token,
             options,
+            // Placeholder, overwritten by `set_retry` once the endpoint count is
+            // known.
+            #[cfg(feature = "failover")]
+            retry: crate::failover::RetryConfig::disabled(),
         }
+    }
+
+    /// Installs the failover config (called once at client construction).
+    #[cfg(feature = "failover")]
+    pub(crate) fn set_retry(&mut self, retry: crate::failover::RetryConfig) {
+        self.retry = retry;
     }
 
     /// Refresh the authentication token if the client has credentials options.
@@ -163,11 +175,50 @@ impl<T> ClientCaller<T> {
         user: String,
         password: String,
     ) -> Result<MetadataValue<Ascii>> {
+        #[cfg(not(feature = "failover"))]
         let resp = self
             .auth_client
             .clone()
             .authenticate(user, password)
             .await?;
+
+        // Authenticate is idempotent (it only mints a token), so fail it over to
+        // a healthy endpoint on a transient error. This keeps an authenticated
+        // connect and in-flight reauth working when the balancer routes the
+        // authenticate RPC to a down node, the scenario failover targets.
+        #[cfg(feature = "failover")]
+        let resp = {
+            use crate::failover::{classify, Decision, RetryPolicy};
+            let max = self.retry.max_attempts.max(1);
+            let mut last = None;
+            let mut ok = None;
+            for attempt in 0..max {
+                let wait = self.retry.backoff(attempt);
+                if !wait.is_zero() {
+                    tokio::time::sleep(wait).await;
+                }
+                match self
+                    .auth_client
+                    .clone()
+                    .authenticate(user.clone(), password.clone())
+                    .await
+                {
+                    Ok(resp) => {
+                        ok = Some(resp);
+                        break;
+                    }
+                    Err(e) => match classify(&e, RetryPolicy::Repeatable) {
+                        Decision::Retry => last = Some(e),
+                        _ => return Err(e),
+                    },
+                }
+            }
+            match ok {
+                Some(resp) => resp,
+                None => return Err(last.expect("retry budget runs at least once")),
+            }
+        };
+
         let token = resp.token().parse()?;
         Ok(token)
     }
