@@ -55,12 +55,20 @@
 //! - `tls-openssl-vendored`: Like `tls-openssl`, however compile openssl from source code and statically link to it.
 //! - `build-server`: Builds a server variant of the etcd protobuf and re-exports it under the same `proto` package as the `pub-response-field` feature does.
 //! - `raw-channel`: Allows the caller to construct the underlying Tonic channel used by the client.
+//! - `failover`: Opt-in request-level failover. When enabled, [`Client`]'s unary
+//!   methods retry idempotent RPCs on transient `Unavailable` errors and fail
+//!   over to a healthy endpoint, re-authenticate on token expiry, and watch /
+//!   lease keep-alive streams transparently reconnect. Mutating RPCs are retried
+//!   only when the request provably never reached a server (write-at-most-once).
+//!   Tune via [`ConnectOptions`]. Not enabled by default.
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 mod channel;
 mod client;
 mod error;
+#[cfg(feature = "failover")]
+mod failover;
 mod intercept;
 mod lock;
 mod namespace;
