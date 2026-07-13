@@ -208,7 +208,16 @@ impl<T> ClientCaller<T> {
                         break;
                     }
                     Err(e) => match classify(&e, RetryPolicy::Repeatable) {
-                        Decision::Retry => last = Some(e),
+                        Decision::Retry => {
+                            tracing::warn!(
+                                target: "etcd_client::failover",
+                                attempt = attempt + 1,
+                                max,
+                                error = %e,
+                                "etcd authenticate RPC failed, failing over to another endpoint",
+                            );
+                            last = Some(e);
+                        }
                         _ => return Err(e),
                     },
                 }

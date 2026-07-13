@@ -798,6 +798,13 @@ impl LeaseKeepAliveDriver {
             if self.out_tx.is_closed() || self.lease_ids.is_empty() {
                 return None;
             }
+            if self.reconnect_attempt == 0 {
+                tracing::warn!(
+                    target: "etcd_client::failover",
+                    leases = self.lease_ids.len(),
+                    "etcd lease keep-alive stream broke, reconnecting and resuming renewals",
+                );
+            }
             // Always wait before (re)opening: a stream that establishes then
             // immediately breaks would otherwise hot-loop with no floor. The
             // delay grows until a response arrives (which resets the counter),
@@ -817,6 +824,11 @@ impl LeaseKeepAliveDriver {
                 // hang. Surface it and stop so the caller can rebuild through
                 // Client.
                 Err(e) if !matches!(classify(&e, RetryPolicy::Repeatable), Decision::Retry) => {
+                    tracing::warn!(
+                        target: "etcd_client::failover",
+                        error = %e,
+                        "etcd lease keep-alive stream reconnect hit a permanent error, giving up",
+                    );
                     let _ = self.out_tx.send(Err(e)).await;
                     return None;
                 }
