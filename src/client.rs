@@ -376,13 +376,29 @@ impl Client {
                         if self.options.user.is_none() {
                             return Err(e);
                         }
+                        tracing::warn!(
+                            target: "etcd_client::failover",
+                            attempt = attempt + 1,
+                            max,
+                            error = %e,
+                            "etcd auth token rejected, refreshing and retrying",
+                        );
                         // Reauth is best-effort: a refresh that itself fails (for
                         // example it hit the down endpoint) must not mask the
                         // original error, so keep it and let the budget continue.
                         let _ = self.refresh_token().await;
                         last = Some(e);
                     }
-                    Decision::Retry => last = Some(e),
+                    Decision::Retry => {
+                        tracing::warn!(
+                            target: "etcd_client::failover",
+                            attempt = attempt + 1,
+                            max,
+                            error = %e,
+                            "etcd unary RPC failed, failing over to another endpoint",
+                        );
+                        last = Some(e);
+                    }
                     Decision::Stop => return Err(e),
                 },
             }

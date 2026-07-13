@@ -860,6 +860,13 @@ impl WatchDriver {
             if self.out_tx.is_closed() || self.watches.is_empty() {
                 return None;
             }
+            if self.reconnect_attempt == 0 {
+                tracing::warn!(
+                    target: "etcd_client::failover",
+                    watches = self.watches.len(),
+                    "etcd watch stream broke, reconnecting and resuming from last revision",
+                );
+            }
             // Always wait before (re)opening: a stream that establishes then
             // immediately breaks would otherwise hot-loop with no floor. The
             // delay grows until a response arrives (which resets the counter),
@@ -879,6 +886,11 @@ impl WatchDriver {
                 // hang. Surface it and stop so the caller can rebuild through
                 // Client.
                 Err(e) if !matches!(classify(&e, RetryPolicy::Repeatable), Decision::Retry) => {
+                    tracing::warn!(
+                        target: "etcd_client::failover",
+                        error = %e,
+                        "etcd watch stream reconnect hit a permanent error, giving up",
+                    );
                     let _ = self.out_tx.send(Err(e)).await;
                     return None;
                 }
