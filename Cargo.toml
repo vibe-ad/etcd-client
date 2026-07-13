@@ -20,7 +20,7 @@ tls-roots = ["tls", "tonic/tls-native-roots"]
 pub-response-field = ["visible"]
 build-server = ["pub-response-field"]
 raw-channel = []
-failover = ["dep:h2", "tokio/time", "tokio/rt"]
+failover = ["dep:h2", "dep:tracing", "tokio/time", "tokio/rt"]
 
 [dependencies]
 tonic = "0.14"
@@ -36,6 +36,7 @@ tower = { version = "0.5", default-features = false }
 # downcast in the failover module silently never matches and write failover
 # degrades. Keep in sync with tonic and verify `cargo tree` shows a single h2.
 h2 = { version = "0.4", optional = true }
+tracing = { version = "0.1", optional = true }
 openssl = { version = "0.10", optional = true }
 hyper = { version = "1.4", features = ["client"], optional = true }
 hyper-openssl = { version = "0.10", features = ["client-legacy", "tokio"], optional = true }
