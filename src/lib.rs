@@ -110,8 +110,8 @@ pub use crate::rpc::watch::{
 };
 pub use crate::rpc::{KeyValue, ResponseHeader};
 
-#[cfg(feature = "tls")]
-#[cfg_attr(docsrs, doc(cfg(feature = "tls")))]
+#[cfg(feature = "_tls")]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "tls-ring", feature = "tls-aws-lc"))))]
 pub use tonic::transport::{Certificate, ClientTlsConfig as TlsOptions, Identity};
 
 #[cfg(feature = "tls-openssl")]
