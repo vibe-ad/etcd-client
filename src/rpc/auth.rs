@@ -726,8 +726,8 @@ impl PartialEq for Permission {
             if self.inner.key == other.inner.key {
                 true
             } else {
-                (self.inner.key.is_empty() && other.inner.key == [b'\0'])
-                    || (self.inner.key == [b'\0'] && other.inner.key.is_empty())
+                (self.inner.key.is_empty() && other.inner.key == *b"\0")
+                    || (self.inner.key == *b"\0" && other.inner.key.is_empty())
             }
         } else {
             false
@@ -748,7 +748,7 @@ impl From<&PbPermission> for Permission {
             with_prefix: false,
         };
 
-        if perm.inner.range_end == [b'\0'] {
+        if perm.inner.range_end == *b"\0" {
             perm.with_from_key = true;
         } else if !perm.inner.range_end.is_empty() {
             let prefix = get_prefix(&perm.inner.key);
