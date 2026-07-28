@@ -1,11 +1,13 @@
 mod testing;
 
-use crate::testing::{get_client, Result, DEFAULT_TEST_ENDPOINT};
+use std::time::Duration;
+
+use crate::testing::{get_auth_client, get_client, Result, DEFAULT_TEST_ENDPOINT};
 use etcd_client::{
-    AlarmAction, AlarmOptions, AlarmType, Client, Compare, CompareOp, ConnectOptions,
-    DeleteOptions, EventType, GetOptions, LeaseGrantOptions, MemberAddOptions, Permission,
-    PermissionType, ProclaimOptions, PutOptions, ResignOptions, RoleRevokePermissionOptions, Txn,
-    TxnOp, TxnOpResponse, UserAddOptions,
+    AlarmAction, AlarmOptions, AlarmType, Compare, CompareOp, ConnectOptions, DeleteOptions,
+    EventType, GetOptions, LeaseGrantOptions, MemberAddOptions, Permission, PermissionType,
+    ProclaimOptions, PutOptions, ResignOptions, RoleRevokePermissionOptions, Txn, TxnOp,
+    TxnOpResponse, UserAddOptions,
 };
 
 #[tokio::test]
@@ -387,11 +389,7 @@ async fn test_auth() -> Result<()> {
     client.put("auth-test", "value", None).await.unwrap_err();
 
     // connect with authenticate, the user must already exists
-    let options = Some(ConnectOptions::new().with_user(
-        "root",    // user name
-        "rootpwd", // password
-    ));
-    let mut client_auth = Client::connect(["localhost:2379"], options).await?;
+    let mut client_auth = get_auth_client(None).await?;
     client_auth.put("auth-test", "value", None).await?;
 
     client_auth.auth_disable().await?;
@@ -403,12 +401,40 @@ async fn test_auth() -> Result<()> {
     Ok(())
 }
 
+#[ignore]
+#[tokio::test]
+async fn test_auth_refresh_token() -> Result<()> {
+    const TOKEN_TTL: Duration = Duration::from_secs(4);
+
+    let mut client = get_client().await?;
+    client.auth_enable().await?;
+
+    let mut client = get_auth_client(None).await?;
+    tokio::time::sleep(TOKEN_TTL).await;
+    // Must expire.
+    client
+        .get("key", None)
+        .await
+        .expect_err(&format!("The test expects that token TTL <= {TOKEN_TTL:?}"));
+
+    let options = Some(ConnectOptions::new().with_auto_token_refresh(true));
+
+    // Verify that a client with auto refresh outlives expiration.
+    let mut client = get_auth_client(options).await?;
+    client.get("key", None).await?;
+    tokio::time::sleep(TOKEN_TTL).await;
+    client.get("key", None).await?;
+    client.auth_disable().await?;
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_role() -> Result<()> {
     let mut client = get_client().await?;
 
-    let role1 = "role1";
-    let role2 = "role2";
+    let role1 = "role1_";
+    let role2 = "role2_";
 
     let _ = client.role_delete(role1).await;
     let _ = client.role_delete(role2).await;

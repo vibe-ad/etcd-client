@@ -1,5 +1,6 @@
 //! Etcd KV Operations.
 
+use crate::caller::{ClientCaller, ClientCallerBuilder};
 pub use crate::rpc::pb::etcdserverpb::compare::CompareResult as CompareOp;
 pub use crate::rpc::pb::etcdserverpb::range_request::{SortOrder, SortTarget};
 
@@ -22,26 +23,31 @@ use crate::vec::VecExt;
 use std::mem::ManuallyDrop;
 use tonic::{IntoRequest, Request};
 
+type Client = PbKvClient<InterceptedChannel>;
+
 /// Client for KV operations.
 #[repr(transparent)]
 #[derive(Clone)]
 pub struct KvClient {
-    inner: PbKvClient<InterceptedChannel>,
+    inner: ClientCaller<Client>,
 }
 
 impl KvClient {
     /// Creates a kv client.
     #[inline]
-    pub(crate) fn new(channel: InterceptedChannel) -> Self {
-        let inner = PbKvClient::new(channel);
-        Self { inner }
+    pub(crate) fn new(builder: ClientCallerBuilder) -> Self {
+        Self {
+            inner: builder.build(Client::new),
+        }
     }
 
     /// Limits the maximum size of a decoded message.
     ///
     /// Default: `4MB`
     pub fn max_decoding_message_size(mut self, limit: usize) -> Self {
-        self.inner = self.inner.max_decoding_message_size(limit);
+        self.inner = self
+            .inner
+            .with(|client| client.max_decoding_message_size(limit));
         self
     }
 
@@ -49,7 +55,9 @@ impl KvClient {
     ///
     /// Default: `usize::MAX`
     pub fn max_encoding_message_size(mut self, limit: usize) -> Self {
-        self.inner = self.inner.max_encoding_message_size(limit);
+        self.inner = self
+            .inner
+            .with(|client| client.max_encoding_message_size(limit));
         self
     }
 
@@ -63,12 +71,13 @@ impl KvClient {
         value: impl Into<Vec<u8>>,
         options: Option<PutOptions>,
     ) -> Result<PutResponse> {
-        let resp = self
-            .inner
-            .put(options.unwrap_or_default().with_kv(key, value))
-            .await?
-            .into_inner();
-        Ok(PutResponse::new(resp))
+        async fn put_impl(client: &mut Client, req: PutOptions) -> Result<PutResponse> {
+            let resp = client.put(req).await?.into_inner();
+            Ok(PutResponse::new(resp))
+        }
+        self.inner
+            .do_call(options.unwrap_or_default().with_kv(key, value), put_impl)
+            .await
     }
 
     /// Gets the key or a range of keys from the store.
@@ -78,12 +87,13 @@ impl KvClient {
         key: impl Into<Vec<u8>>,
         options: Option<GetOptions>,
     ) -> Result<GetResponse> {
-        let resp = self
-            .inner
-            .range(options.unwrap_or_default().with_key(key.into()))
-            .await?
-            .into_inner();
-        Ok(GetResponse::new(resp))
+        async fn get_impl(client: &mut Client, req: GetOptions) -> Result<GetResponse> {
+            let resp = client.range(req).await?.into_inner();
+            Ok(GetResponse::new(resp))
+        }
+        self.inner
+            .do_call(options.unwrap_or_default().with_key(key.into()), get_impl)
+            .await
     }
 
     /// Deletes the given key or a range of keys from the key-value store.
@@ -93,12 +103,16 @@ impl KvClient {
         key: impl Into<Vec<u8>>,
         options: Option<DeleteOptions>,
     ) -> Result<DeleteResponse> {
-        let resp = self
-            .inner
-            .delete_range(options.unwrap_or_default().with_key(key.into()))
-            .await?
-            .into_inner();
-        Ok(DeleteResponse::new(resp))
+        async fn delete_impl(client: &mut Client, req: DeleteOptions) -> Result<DeleteResponse> {
+            let resp = client.delete_range(req).await?.into_inner();
+            Ok(DeleteResponse::new(resp))
+        }
+        self.inner
+            .do_call(
+                options.unwrap_or_default().with_key(key.into()),
+                delete_impl,
+            )
+            .await
     }
 
     /// Compacts the event history in the etcd key-value store. The key-value
@@ -110,12 +124,19 @@ impl KvClient {
         revision: i64,
         options: Option<CompactionOptions>,
     ) -> Result<CompactionResponse> {
-        let resp = self
-            .inner
-            .compact(options.unwrap_or_default().with_revision(revision))
-            .await?
-            .into_inner();
-        Ok(CompactionResponse::new(resp))
+        async fn compact_impl(
+            client: &mut Client,
+            req: CompactionOptions,
+        ) -> Result<CompactionResponse> {
+            let resp = client.compact(req).await?.into_inner();
+            Ok(CompactionResponse::new(resp))
+        }
+        self.inner
+            .do_call(
+                options.unwrap_or_default().with_revision(revision),
+                compact_impl,
+            )
+            .await
     }
 
     /// Processes multiple operations in a single transaction.
@@ -124,8 +145,11 @@ impl KvClient {
     /// It is not allowed to modify the same key several times within one txn.
     #[inline]
     pub async fn txn(&mut self, txn: Txn) -> Result<TxnResponse> {
-        let resp = self.inner.txn(txn).await?.into_inner();
-        Ok(TxnResponse::new(resp))
+        async fn txn_impl(client: &mut Client, txn: Txn) -> Result<TxnResponse> {
+            let resp = client.txn(txn).await?.into_inner();
+            Ok(TxnResponse::new(resp))
+        }
+        self.inner.do_call(txn, txn_impl).await
     }
 }
 

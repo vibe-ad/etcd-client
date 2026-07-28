@@ -1,5 +1,6 @@
 //! Etcd Watch RPC.
 
+use crate::caller::{ClientCaller, ClientCallerBuilder};
 pub use crate::rpc::pb::mvccpb::event::EventType;
 
 use crate::error::{Error, Result};
@@ -18,26 +19,31 @@ use tokio::sync::mpsc::{channel, Sender};
 use tokio_stream::{wrappers::ReceiverStream, Stream};
 use tonic::Streaming;
 
+type Client = PbWatchClient<InterceptedChannel>;
+
 /// Client for watch operations.
 #[repr(transparent)]
 #[derive(Clone)]
 pub struct WatchClient {
-    inner: PbWatchClient<InterceptedChannel>,
+    inner: ClientCaller<Client>,
 }
 
 impl WatchClient {
     /// Creates a watch client.
     #[inline]
-    pub(crate) fn new(channel: InterceptedChannel) -> Self {
-        let inner = PbWatchClient::new(channel);
-        Self { inner }
+    pub(crate) fn new(builder: ClientCallerBuilder) -> Self {
+        Self {
+            inner: builder.build(Client::new),
+        }
     }
 
     /// Limits the maximum size of a decoded message.
     ///
     /// Default: `4MB`
     pub fn max_decoding_message_size(mut self, limit: usize) -> Self {
-        self.inner = self.inner.max_decoding_message_size(limit);
+        self.inner = self
+            .inner
+            .with(|client| client.max_decoding_message_size(limit));
         self
     }
 
@@ -53,14 +59,19 @@ impl WatchClient {
         key: impl Into<Vec<u8>>,
         options: Option<WatchOptions>,
     ) -> Result<WatchStream> {
-        let (request_sender, request_receiver) = channel::<WatchRequest>(100);
-        request_sender
-            .send(options.unwrap_or_default().with_key(key).into())
+        async fn watch_impl(client: &mut Client, options: WatchOptions) -> Result<WatchStream> {
+            let (request_sender, request_receiver) = channel::<WatchRequest>(100);
+            request_sender
+                .send(options.into())
+                .await
+                .map_err(|e| Error::WatchError(e.to_string()))?;
+            let request_stream = ReceiverStream::new(request_receiver);
+            let stream = client.watch(request_stream).await?.into_inner();
+            Ok(WatchStream::new(request_sender, stream))
+        }
+        self.inner
+            .do_call(options.unwrap_or_default().with_key(key), watch_impl)
             .await
-            .map_err(|e| Error::WatchError(e.to_string()))?;
-        let request_stream = ReceiverStream::new(request_receiver);
-        let response_stream = self.inner.watch(request_stream).await?.into_inner();
-        Ok(WatchStream::new(request_sender, response_stream))
     }
 }
 

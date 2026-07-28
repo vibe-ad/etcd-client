@@ -1,5 +1,6 @@
 //! Etcd Cluster RPC.
 
+use crate::caller::{ClientCaller, ClientCallerBuilder};
 use crate::error::Result;
 use crate::intercept::InterceptedChannel;
 use crate::rpc::pb::etcdserverpb::cluster_client::ClusterClient as PbClusterClient;
@@ -14,19 +15,22 @@ use crate::rpc::pb::etcdserverpb::{
 use crate::rpc::ResponseHeader;
 use tonic::{IntoRequest, Request};
 
+type Client = PbClusterClient<InterceptedChannel>;
+
 /// Client for Cluster operations.
 #[repr(transparent)]
 #[derive(Clone)]
 pub struct ClusterClient {
-    inner: PbClusterClient<InterceptedChannel>,
+    inner: ClientCaller<Client>,
 }
 
 impl ClusterClient {
     /// Creates an Cluster client.
     #[inline]
-    pub(crate) fn new(channel: InterceptedChannel) -> Self {
-        let inner = PbClusterClient::new(channel);
-        Self { inner }
+    pub(crate) fn new(builder: ClientCallerBuilder) -> Self {
+        Self {
+            inner: builder.build(Client::new),
+        }
     }
 
     /// Adds a new member into the cluster.
@@ -36,24 +40,31 @@ impl ClusterClient {
         urls: impl Into<Vec<String>>,
         options: Option<MemberAddOptions>,
     ) -> Result<MemberAddResponse> {
-        let resp = self
-            .inner
-            .member_add(options.unwrap_or_default().with_urls(urls))
-            .await?
-            .into_inner();
-
-        Ok(MemberAddResponse::new(resp))
+        async fn member_add_impl(
+            client: &mut Client,
+            options: MemberAddOptions,
+        ) -> Result<MemberAddResponse> {
+            let resp = client.member_add(options).await?.into_inner();
+            Ok(MemberAddResponse::new(resp))
+        }
+        self.inner
+            .do_call(options.unwrap_or_default().with_urls(urls), member_add_impl)
+            .await
     }
 
     /// Removes an existing member from the cluster.
     #[inline]
     pub async fn member_remove(&mut self, id: u64) -> Result<MemberRemoveResponse> {
-        let resp = self
-            .inner
-            .member_remove(MemberRemoveOptions::new().with_id(id))
-            .await?
-            .into_inner();
-        Ok(MemberRemoveResponse::new(resp))
+        async fn member_remove_impl(
+            client: &mut Client,
+            options: MemberRemoveOptions,
+        ) -> Result<MemberRemoveResponse> {
+            let resp = client.member_remove(options).await?.into_inner();
+            Ok(MemberRemoveResponse::new(resp))
+        }
+        self.inner
+            .do_call(MemberRemoveOptions::new().with_id(id), member_remove_impl)
+            .await
     }
 
     /// Updates the member configuration.
@@ -63,34 +74,49 @@ impl ClusterClient {
         id: u64,
         url: impl Into<Vec<String>>,
     ) -> Result<MemberUpdateResponse> {
-        let resp = self
-            .inner
-            .member_update(MemberUpdateOptions::new().with_option(id, url))
-            .await?
-            .into_inner();
-        Ok(MemberUpdateResponse::new(resp))
+        async fn member_update_impl(
+            client: &mut Client,
+            options: MemberUpdateOptions,
+        ) -> Result<MemberUpdateResponse> {
+            let resp = client.member_update(options).await?.into_inner();
+            Ok(MemberUpdateResponse::new(resp))
+        }
+        self.inner
+            .do_call(
+                MemberUpdateOptions::new().with_option(id, url),
+                member_update_impl,
+            )
+            .await
     }
 
     /// Lists all the members in the cluster.
     #[inline]
     pub async fn member_list(&mut self) -> Result<MemberListResponse> {
-        let resp = self
-            .inner
-            .member_list(PbMemberListRequest {})
-            .await?
-            .into_inner();
-        Ok(MemberListResponse::new(resp))
+        async fn member_list_impl(
+            client: &mut Client,
+            options: PbMemberListRequest,
+        ) -> Result<MemberListResponse> {
+            let resp = client.member_list(options).await?.into_inner();
+            Ok(MemberListResponse::new(resp))
+        }
+        self.inner
+            .do_call(PbMemberListRequest {}, member_list_impl)
+            .await
     }
 
     /// Promotes a member from raft learner (non-voting) to raft voting member.
     #[inline]
     pub async fn member_promote(&mut self, id: u64) -> Result<MemberPromoteResponse> {
-        let resp = self
-            .inner
-            .member_promote(MemberPromoteOptions::new().with_id(id))
-            .await?
-            .into_inner();
-        Ok(MemberPromoteResponse::new(resp))
+        async fn member_promote_impl(
+            client: &mut Client,
+            options: MemberPromoteOptions,
+        ) -> Result<MemberPromoteResponse> {
+            let resp = client.member_promote(options).await?.into_inner();
+            Ok(MemberPromoteResponse::new(resp))
+        }
+        self.inner
+            .do_call(MemberPromoteOptions::new().with_id(id), member_promote_impl)
+            .await
     }
 }
 

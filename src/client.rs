@@ -1,10 +1,10 @@
 //! Asynchronous client & synchronous client.
 
+use crate::caller::{CallOptions, ClientCaller, ClientCallerBuilder};
 #[cfg(feature = "raw-channel")]
 use crate::channel::Channel;
 use crate::error::{Error, Result};
 use crate::intercept::{InterceptedChannel, Interceptor};
-use crate::lock::RwLockExt;
 #[cfg(feature = "tls-openssl")]
 use crate::openssl_tls::{OpenSslClientConfig, OpenSslConnector};
 use crate::rpc::auth::Permission;
@@ -54,6 +54,8 @@ use tonic::transport::{channel::Change, Endpoint};
 const HTTP_PREFIX: &str = "http://";
 const HTTPS_PREFIX: &str = "https://";
 
+pub(crate) type AuthToken = Arc<RwLock<Option<MetadataValue<Ascii>>>>;
+
 /// Asynchronous `etcd` client using v3 API.
 #[derive(Clone)]
 pub struct Client {
@@ -65,9 +67,11 @@ pub struct Client {
     maintenance: MaintenanceClient,
     cluster: ClusterClient,
     election: ElectionClient,
+    /// Note: the relevant [`ConnectOptions::user`] maintenance is
+    /// the [`Self::client_caller`] responsibility.
     options: ConnectOptions,
     tx: Option<Sender<Change<Uri, Endpoint>>>,
-    auth_token: Arc<RwLock<Option<MetadataValue<Ascii>>>>,
+    client_caller: ClientCaller<()>,
 }
 
 impl Client {
@@ -246,14 +250,17 @@ impl Client {
         auth_token: Arc<RwLock<Option<MetadataValue<Ascii>>>>,
         options: ConnectOptions,
     ) -> Self {
-        let kv = KvClient::new(channel.clone());
-        let watch = WatchClient::new(channel.clone());
-        let lease = LeaseClient::new(channel.clone());
-        let lock = LockClient::new(channel.clone());
         let auth = AuthClient::new(channel.clone());
-        let cluster = ClusterClient::new(channel.clone());
-        let maintenance = MaintenanceClient::new(channel.clone());
-        let election = ElectionClient::new(channel);
+        let builder =
+            ClientCallerBuilder::new((&options).into(), auth_token, auth.clone(), channel);
+
+        let kv = KvClient::new(builder.clone());
+        let watch = WatchClient::new(builder.clone());
+        let lease = LeaseClient::new(builder.clone());
+        let lock = LockClient::new(builder.clone());
+        let cluster = ClusterClient::new(builder.clone());
+        let maintenance = MaintenanceClient::new(builder.clone());
+        let election = ElectionClient::new(builder.clone());
 
         Self {
             kv,
@@ -266,7 +273,7 @@ impl Client {
             election,
             options,
             tx,
-            auth_token,
+            client_caller: builder.build(|_| ()),
         }
     }
 
@@ -748,25 +755,9 @@ impl Client {
         self.election.resign(option).await
     }
 
-    async fn do_authenticate(
-        &self,
-        user: String,
-        password: String,
-    ) -> Result<MetadataValue<Ascii>> {
-        let resp = self.auth_client().authenticate(user, password).await?;
-        let token = resp.token().parse()?;
-        Ok(token)
-    }
-
     /// Refresh the authentication token if the client has credentials options.
     pub async fn refresh_token(&self) -> Result<()> {
-        if let Some((user, password)) = self.options.user.as_ref() {
-            let token = self.do_authenticate(user.clone(), password.clone()).await?;
-            self.auth_token.write_unpoisoned().replace(token);
-        } else {
-            let _ = self.auth_token.write_unpoisoned().take();
-        }
-        Ok(())
+        self.client_caller.refresh_token().await
     }
 
     /// Updates the user credentials for the client in flight.
@@ -777,14 +768,7 @@ impl Client {
     ///
     /// If the user is `None`, it will remove the authentication token from the client.
     pub async fn update_user(&mut self, user: Option<(String, String)>) -> Result<()> {
-        if let Some((ref name, ref password)) = user {
-            let token = self.do_authenticate(name.clone(), password.clone()).await?;
-            self.auth_token.write_unpoisoned().replace(token);
-        } else {
-            let _ = self.auth_token.write_unpoisoned().take();
-        }
-        self.options.user = user;
-        Ok(())
+        self.client_caller.update_user(user).await
     }
 }
 
@@ -809,6 +793,8 @@ pub struct ConnectOptions {
     otls: Option<OpenSslResult<OpenSslConnector>>,
     /// Require a leader to be present for the operation to complete.
     require_leader: bool,
+    /// Automatically refresh the authentication token on expiration.
+    refresh_expired_token: bool,
 }
 
 impl ConnectOptions {
@@ -889,6 +875,14 @@ impl ConnectOptions {
         self
     }
 
+    /// Whether to automatically refresh the authentication token when the current
+    /// token has expired. Note that, when this feature is enabled, each request is
+    /// *CLONED* so that it can be retried.
+    pub fn with_auto_token_refresh(mut self, refresh_expired_token: bool) -> Self {
+        self.refresh_expired_token = refresh_expired_token;
+        self
+    }
+
     /// Creates a `ConnectOptions`.
     #[inline]
     pub const fn new() -> Self {
@@ -904,6 +898,16 @@ impl ConnectOptions {
             #[cfg(feature = "tls-openssl")]
             otls: None,
             require_leader: false,
+            refresh_expired_token: false,
+        }
+    }
+}
+
+impl From<&ConnectOptions> for CallOptions {
+    fn from(options: &ConnectOptions) -> Self {
+        Self {
+            creds: Arc::new(RwLock::new(options.user.clone())),
+            refresh_expired_token: options.refresh_expired_token,
         }
     }
 }
