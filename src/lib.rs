@@ -65,6 +65,7 @@
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
+mod caller;
 mod channel;
 mod client;
 mod error;

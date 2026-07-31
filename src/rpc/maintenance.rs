@@ -1,5 +1,6 @@
 //! Etcd Maintenance RPC.
 
+use crate::caller::{ClientCaller, ClientCallerBuilder};
 pub use crate::rpc::pb::etcdserverpb::alarm_request::AlarmAction;
 pub use crate::rpc::pb::etcdserverpb::AlarmType;
 
@@ -21,11 +22,13 @@ use etcdserverpb::AlarmMember as PbAlarmMember;
 use tonic::codec::Streaming as PbStreaming;
 use tonic::{IntoRequest, Request};
 
+type Client = PbMaintenanceClient<InterceptedChannel>;
+
 /// Client for maintenance operations.
 #[repr(transparent)]
 #[derive(Clone)]
 pub struct MaintenanceClient {
-    inner: PbMaintenanceClient<InterceptedChannel>,
+    inner: ClientCaller<Client>,
 }
 
 /// Options for `alarm` operation.
@@ -553,9 +556,10 @@ impl MoveLeaderResponse {
 impl MaintenanceClient {
     /// Creates a maintenance client.
     #[inline]
-    pub(crate) fn new(channel: InterceptedChannel) -> Self {
-        let inner = PbMaintenanceClient::new(channel);
-        Self { inner }
+    pub(crate) fn new(builder: ClientCallerBuilder) -> Self {
+        Self {
+            inner: builder.build(Client::new),
+        }
     }
 
     /// Get or active or inactive alarm.
@@ -566,34 +570,46 @@ impl MaintenanceClient {
         alarm_type: AlarmType,
         options: Option<AlarmOptions>,
     ) -> Result<AlarmResponse> {
-        let resp = self
-            .inner
-            .alarm(
+        async fn alarm_impl(client: &mut Client, options: AlarmOptions) -> Result<AlarmResponse> {
+            let resp = client.alarm(options).await?.into_inner();
+            Ok(AlarmResponse::new(resp))
+        }
+        self.inner
+            .do_call(
                 options
                     .unwrap_or_default()
                     .with_action_and_type(alarm_action, alarm_type),
+                alarm_impl,
             )
-            .await?
-            .into_inner();
-        Ok(AlarmResponse::new(resp))
+            .await
     }
 
     /// Get status of a member.
     #[inline]
     pub async fn status(&mut self) -> Result<StatusResponse> {
-        let resp = self.inner.status(StatusOptions::new()).await?.into_inner();
-        Ok(StatusResponse::new(resp))
+        async fn status_impl(
+            client: &mut Client,
+            options: StatusOptions,
+        ) -> Result<StatusResponse> {
+            let resp = client.status(options).await?.into_inner();
+            Ok(StatusResponse::new(resp))
+        }
+        self.inner.do_call(StatusOptions::new(), status_impl).await
     }
 
     /// Defragment a member's backend database to recover storage space.
     #[inline]
     pub async fn defragment(&mut self) -> Result<DefragmentResponse> {
-        let resp = self
-            .inner
-            .defragment(DefragmentOptions::new())
-            .await?
-            .into_inner();
-        Ok(DefragmentResponse::new(resp))
+        async fn defragment_impl(
+            client: &mut Client,
+            options: DefragmentOptions,
+        ) -> Result<DefragmentResponse> {
+            let resp = client.defragment(options).await?.into_inner();
+            Ok(DefragmentResponse::new(resp))
+        }
+        self.inner
+            .do_call(DefragmentOptions::new(), defragment_impl)
+            .await
     }
 
     /// Computes the hash of whole backend keyspace.
@@ -601,41 +617,59 @@ impl MaintenanceClient {
     /// This is designed for testing ONLY!
     #[inline]
     pub async fn hash(&mut self) -> Result<HashResponse> {
-        let resp = self.inner.hash(HashOptions::new()).await?.into_inner();
-        Ok(HashResponse::new(resp))
+        async fn hash_impl(client: &mut Client, options: HashOptions) -> Result<HashResponse> {
+            let resp = client.hash(options).await?.into_inner();
+            Ok(HashResponse::new(resp))
+        }
+        self.inner.do_call(HashOptions::new(), hash_impl).await
     }
 
     /// Computes the hash of all MVCC keys up to a given revision.
     /// It only iterates \"key\" bucket in backend storage.
     #[inline]
     pub async fn hash_kv(&mut self, revision: i64) -> Result<HashKvResponse> {
-        let resp = self
-            .inner
-            .hash_kv(HashKvOptions::new(revision))
-            .await?
-            .into_inner();
-        Ok(HashKvResponse::new(resp))
+        async fn hash_kv_impl(
+            client: &mut Client,
+            options: HashKvOptions,
+        ) -> Result<HashKvResponse> {
+            let resp = client.hash_kv(options).await?.into_inner();
+            Ok(HashKvResponse::new(resp))
+        }
+        self.inner
+            .do_call(HashKvOptions::new(revision), hash_kv_impl)
+            .await
     }
 
     /// Gets a snapshot of the entire backend from a member over a stream to a client.
     #[inline]
     pub async fn snapshot(&mut self) -> Result<SnapshotStreaming> {
-        let resp = self
-            .inner
-            .snapshot(SnapshotOptions::new())
-            .await?
-            .into_inner();
-        Ok(SnapshotStreaming(resp))
+        async fn snapshot_impl(
+            client: &mut Client,
+            options: SnapshotOptions,
+        ) -> Result<SnapshotStreaming> {
+            let resp = client.snapshot(options).await?.into_inner();
+            Ok(SnapshotStreaming(resp))
+        }
+        self.inner
+            .do_call(SnapshotOptions::new(), snapshot_impl)
+            .await
     }
 
     /// Moves the current leader node to target node.
     #[inline]
     pub async fn move_leader(&mut self, target_id: u64) -> Result<MoveLeaderResponse> {
-        let resp = self
-            .inner
-            .move_leader(MoveLeaderOptions::new().with_target_id(target_id))
-            .await?
-            .into_inner();
-        Ok(MoveLeaderResponse::new(resp))
+        async fn move_leader_impl(
+            client: &mut Client,
+            options: MoveLeaderOptions,
+        ) -> Result<MoveLeaderResponse> {
+            let resp = client.move_leader(options).await?.into_inner();
+            Ok(MoveLeaderResponse::new(resp))
+        }
+        self.inner
+            .do_call(
+                MoveLeaderOptions::new().with_target_id(target_id),
+                move_leader_impl,
+            )
+            .await
     }
 }

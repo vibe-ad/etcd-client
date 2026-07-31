@@ -1,6 +1,7 @@
 //! Etcd Lock RPC.
 
 use super::pb::v3lockpb;
+use crate::caller::{ClientCaller, ClientCallerBuilder};
 use crate::error::Result;
 use crate::intercept::InterceptedChannel;
 use crate::rpc::ResponseHeader;
@@ -11,21 +12,23 @@ use v3lockpb::{
     UnlockResponse as PbUnlockResponse,
 };
 
+type Client = PbLockClient<InterceptedChannel>;
+
 /// Client for Lock operations.
 #[repr(transparent)]
 #[derive(Clone)]
 pub struct LockClient {
-    inner: PbLockClient<InterceptedChannel>,
+    inner: ClientCaller<Client>,
 }
 
 impl LockClient {
     /// Creates a lock client.
     #[inline]
-    pub(crate) fn new(channel: InterceptedChannel) -> Self {
-        let inner = PbLockClient::new(channel);
-        Self { inner }
+    pub(crate) fn new(builder: ClientCallerBuilder) -> Self {
+        Self {
+            inner: builder.build(Client::new),
+        }
     }
-
     /// Acquires a distributed shared lock on a given named lock.
     /// On success, it will return a unique key that exists so long as the
     /// lock is held by the caller. This key can be used in conjunction with
@@ -38,12 +41,13 @@ impl LockClient {
         name: impl Into<Vec<u8>>,
         options: Option<LockOptions>,
     ) -> Result<LockResponse> {
-        let resp = self
-            .inner
-            .lock(options.unwrap_or_default().with_name(name))
-            .await?
-            .into_inner();
-        Ok(LockResponse::new(resp))
+        async fn lock_impl(client: &mut Client, options: LockOptions) -> Result<LockResponse> {
+            let resp = client.lock(options).await?.into_inner();
+            Ok(LockResponse::new(resp))
+        }
+        self.inner
+            .do_call(options.unwrap_or_default().with_name(name), lock_impl)
+            .await
     }
 
     /// Takes a key returned by Lock and releases the hold on lock. The
@@ -51,12 +55,16 @@ impl LockClient {
     /// ownership of the lock.
     #[inline]
     pub async fn unlock(&mut self, key: impl Into<Vec<u8>>) -> Result<UnlockResponse> {
-        let resp = self
-            .inner
-            .unlock(UnlockOptions::new().with_key(key))
-            .await?
-            .into_inner();
-        Ok(UnlockResponse::new(resp))
+        async fn unlock_impl(
+            client: &mut Client,
+            options: UnlockOptions,
+        ) -> Result<UnlockResponse> {
+            let resp = client.unlock(options).await?.into_inner();
+            Ok(UnlockResponse::new(resp))
+        }
+        self.inner
+            .do_call(UnlockOptions::new().with_key(key), unlock_impl)
+            .await
     }
 }
 

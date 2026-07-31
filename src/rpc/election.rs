@@ -1,5 +1,6 @@
 //! Etcd Election RPC.
 
+use crate::caller::{ClientCaller, ClientCallerBuilder};
 use crate::error::Result;
 use crate::intercept::InterceptedChannel;
 use crate::rpc::pb::v3electionpb::election_client::ElectionClient as PbElectionClient;
@@ -15,11 +16,13 @@ use std::task::{Context, Poll};
 use tokio_stream::Stream;
 use tonic::{IntoRequest, Request, Streaming};
 
+type Client = PbElectionClient<InterceptedChannel>;
+
 /// Client for Elect operations.
 #[repr(transparent)]
 #[derive(Clone)]
 pub struct ElectionClient {
-    inner: PbElectionClient<InterceptedChannel>,
+    inner: ClientCaller<Client>,
 }
 
 /// Options for `campaign` operation.
@@ -484,9 +487,10 @@ impl From<&PbLeaderKey> for &LeaderKey {
 impl ElectionClient {
     /// Creates a election
     #[inline]
-    pub(crate) fn new(channel: InterceptedChannel) -> Self {
-        let inner = PbElectionClient::new(channel);
-        Self { inner }
+    pub(crate) fn new(builder: ClientCallerBuilder) -> Self {
+        Self {
+            inner: builder.build(Client::new),
+        }
     }
 
     /// Puts a value as eligible for the election on the prefix key.
@@ -499,17 +503,23 @@ impl ElectionClient {
         value: impl Into<Vec<u8>>,
         lease: i64,
     ) -> Result<CampaignResponse> {
-        let resp = self
-            .inner
-            .campaign(
+        async fn campaign_impl(
+            client: &mut Client,
+            options: CampaignOptions,
+        ) -> Result<CampaignResponse> {
+            let resp = client.campaign(options).await?.into_inner();
+            Ok(CampaignResponse::new(resp))
+        }
+
+        self.inner
+            .do_call(
                 CampaignOptions::new()
                     .with_name(name)
                     .with_value(value)
                     .with_lease(lease),
+                campaign_impl,
             )
-            .await?
-            .into_inner();
-        Ok(CampaignResponse::new(resp))
+            .await
     }
 
     /// Lets the leader announce a new value without another election.
@@ -519,46 +529,61 @@ impl ElectionClient {
         value: impl Into<Vec<u8>>,
         options: Option<ProclaimOptions>,
     ) -> Result<ProclaimResponse> {
-        let resp = self
-            .inner
-            .proclaim(options.unwrap_or_default().with_value(value))
-            .await?
-            .into_inner();
-        Ok(ProclaimResponse::new(resp))
+        async fn proclaim_impl(
+            client: &mut Client,
+            options: ProclaimOptions,
+        ) -> Result<ProclaimResponse> {
+            let resp = client.proclaim(options).await?.into_inner();
+            Ok(ProclaimResponse::new(resp))
+        }
+        self.inner
+            .do_call(options.unwrap_or_default().with_value(value), proclaim_impl)
+            .await
     }
 
     /// Returns the leader value for the current election.
     #[inline]
     pub async fn leader(&mut self, name: impl Into<Vec<u8>>) -> Result<LeaderResponse> {
-        let resp = self
-            .inner
-            .leader(LeaderOptions::new().with_name(name))
-            .await?
-            .into_inner();
-        Ok(LeaderResponse::new(resp))
+        async fn leader_impl(
+            client: &mut Client,
+            options: LeaderOptions,
+        ) -> Result<LeaderResponse> {
+            let resp = client.leader(options).await?.into_inner();
+            Ok(LeaderResponse::new(resp))
+        }
+        self.inner
+            .do_call(LeaderOptions::new().with_name(name), leader_impl)
+            .await
     }
 
     /// Returns a channel that reliably observes ordered leader proposals
     /// as GetResponse values on every current elected leader key.
     #[inline]
     pub async fn observe(&mut self, name: impl Into<Vec<u8>>) -> Result<ObserveStream> {
-        let resp = self
-            .inner
-            .observe(LeaderOptions::new().with_name(name))
-            .await?
-            .into_inner();
-
-        Ok(ObserveStream::new(resp))
+        async fn observe_impl(
+            client: &mut Client,
+            options: LeaderOptions,
+        ) -> Result<ObserveStream> {
+            let resp = client.observe(options).await?.into_inner();
+            Ok(ObserveStream::new(resp))
+        }
+        self.inner
+            .do_call(LeaderOptions::new().with_name(name), observe_impl)
+            .await
     }
 
     /// Releases election leadership and then start a new election
     #[inline]
     pub async fn resign(&mut self, option: Option<ResignOptions>) -> Result<ResignResponse> {
-        let resp = self
-            .inner
-            .resign(option.unwrap_or_default())
-            .await?
-            .into_inner();
-        Ok(ResignResponse::new(resp))
+        async fn resign_impl(
+            client: &mut Client,
+            options: ResignOptions,
+        ) -> Result<ResignResponse> {
+            let resp = client.resign(options).await?.into_inner();
+            Ok(ResignResponse::new(resp))
+        }
+        self.inner
+            .do_call(option.unwrap_or_default(), resign_impl)
+            .await
     }
 }

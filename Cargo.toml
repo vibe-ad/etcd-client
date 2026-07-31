@@ -43,6 +43,7 @@ hyper-util = { version = "0.1", features = ["client-legacy"], optional = true }
 
 [dev-dependencies]
 tokio = { version = "1.38", features = ["full"] }
+serial_test = "3"
 
 [build-dependencies]
 tonic-build = { version = "0.14", default-features = false }

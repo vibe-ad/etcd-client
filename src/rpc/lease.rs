@@ -1,5 +1,6 @@
 //! Etcd Lease RPC.
 
+use crate::caller::{ClientCaller, ClientCallerBuilder};
 use crate::error::Result;
 use crate::intercept::InterceptedChannel;
 use crate::rpc::pb::etcdserverpb::lease_client::LeaseClient as PbLeaseClient;
@@ -22,19 +23,22 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::Stream;
 use tonic::{IntoRequest, Request, Streaming};
 
+type Client = PbLeaseClient<InterceptedChannel>;
+
 /// Client for lease operations.
 #[repr(transparent)]
 #[derive(Clone)]
 pub struct LeaseClient {
-    inner: PbLeaseClient<InterceptedChannel>,
+    inner: ClientCaller<Client>,
 }
 
 impl LeaseClient {
     /// Creates a `LeaseClient`.
     #[inline]
-    pub(crate) fn new(channel: InterceptedChannel) -> Self {
-        let inner = PbLeaseClient::new(channel);
-        Self { inner }
+    pub(crate) fn new(builder: ClientCallerBuilder) -> Self {
+        Self {
+            inner: builder.build(Client::new),
+        }
     }
 
     /// Creates a lease which expires if the server does not receive a keepAlive
@@ -46,38 +50,64 @@ impl LeaseClient {
         ttl: i64,
         options: Option<LeaseGrantOptions>,
     ) -> Result<LeaseGrantResponse> {
-        let resp = self
-            .inner
-            .lease_grant(options.unwrap_or_default().with_ttl(ttl))
-            .await?
-            .into_inner();
-        Ok(LeaseGrantResponse::new(resp))
+        async fn grant_impl(
+            client: &mut Client,
+            options: LeaseGrantOptions,
+        ) -> Result<LeaseGrantResponse> {
+            Ok(LeaseGrantResponse::new(
+                client.lease_grant(options).await?.into_inner(),
+            ))
+        }
+        self.inner
+            .do_call(options.unwrap_or_default().with_ttl(ttl), grant_impl)
+            .await
     }
 
     /// Revokes a lease. All keys attached to the lease will expire and be deleted.
     #[inline]
     pub async fn revoke(&mut self, id: i64) -> Result<LeaseRevokeResponse> {
-        let resp = self
-            .inner
-            .lease_revoke(LeaseRevokeOptions::new().with_id(id))
-            .await?
-            .into_inner();
-        Ok(LeaseRevokeResponse::new(resp))
+        async fn revoke_impl(
+            client: &mut Client,
+            options: LeaseRevokeOptions,
+        ) -> Result<LeaseRevokeResponse> {
+            let resp = client.lease_revoke(options).await?.into_inner();
+            Ok(LeaseRevokeResponse::new(resp))
+        }
+
+        self.inner
+            .do_call(LeaseRevokeOptions::new().with_id(id), revoke_impl)
+            .await
     }
 
     /// Keeps the lease alive by streaming keep alive requests from the client
     /// to the server and streaming keep alive responses from the server to the client.
     #[inline]
     pub async fn keep_alive(&mut self, id: i64) -> Result<(LeaseKeeper, LeaseKeepAliveStream)> {
-        let (sender, receiver) = channel::<PbLeaseKeepAliveRequest>(100);
-        sender
-            .send(LeaseKeepAliveOptions::new().with_id(id).into())
-            .await
-            .map_err(|e| Error::LeaseKeepAliveError(e.to_string()))?;
+        async fn keep_alive_impl(
+            client: &mut Client,
+            options: PbLeaseKeepAliveRequest,
+        ) -> Result<(
+            Sender<PbLeaseKeepAliveRequest>,
+            Streaming<PbLeaseKeepAliveResponse>,
+        )> {
+            let (sender, receiver) = channel::<PbLeaseKeepAliveRequest>(100);
+            sender
+                .send(options)
+                .await
+                .map_err(|e| Error::LeaseKeepAliveError(e.to_string()))?;
 
-        let receiver = ReceiverStream::new(receiver);
+            let receiver = ReceiverStream::new(receiver);
+            let resp = client.lease_keep_alive(receiver).await?.into_inner();
+            Ok((sender, resp))
+        }
 
-        let mut stream = self.inner.lease_keep_alive(receiver).await?.into_inner();
+        let (sender, mut stream) = self
+            .inner
+            .do_call(
+                LeaseKeepAliveOptions::new().with_id(id).into(),
+                keep_alive_impl,
+            )
+            .await?;
 
         let id = match stream.message().await? {
             Some(resp) => {
@@ -106,23 +136,33 @@ impl LeaseClient {
         id: i64,
         options: Option<LeaseTimeToLiveOptions>,
     ) -> Result<LeaseTimeToLiveResponse> {
-        let resp = self
-            .inner
-            .lease_time_to_live(options.unwrap_or_default().with_id(id))
-            .await?
-            .into_inner();
-        Ok(LeaseTimeToLiveResponse::new(resp))
+        async fn time_to_live_impl(
+            client: &mut Client,
+            options: LeaseTimeToLiveOptions,
+        ) -> Result<LeaseTimeToLiveResponse> {
+            let resp = client.lease_time_to_live(options).await?.into_inner();
+            Ok(LeaseTimeToLiveResponse::new(resp))
+        }
+
+        self.inner
+            .do_call(options.unwrap_or_default().with_id(id), time_to_live_impl)
+            .await
     }
 
     /// Lists all existing leases.
     #[inline]
     pub async fn leases(&mut self) -> Result<LeaseLeasesResponse> {
-        let resp = self
-            .inner
-            .lease_leases(PbLeaseLeasesRequest {})
-            .await?
-            .into_inner();
-        Ok(LeaseLeasesResponse::new(resp))
+        async fn leases_impl(
+            client: &mut Client,
+            req: PbLeaseLeasesRequest,
+        ) -> Result<LeaseLeasesResponse> {
+            let resp = client.lease_leases(req).await?.into_inner();
+            Ok(LeaseLeasesResponse::new(resp))
+        }
+
+        self.inner
+            .do_call(PbLeaseLeasesRequest {}, leases_impl)
+            .await
     }
 }
 
