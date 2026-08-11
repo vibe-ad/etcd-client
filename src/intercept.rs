@@ -35,11 +35,7 @@ impl TonicInterceptor for Interceptor {
     ) -> Result<tonic::Request<()>, tonic::Status> {
         if let Some(method) = request.extensions().get::<GrpcMethod>() {
             match (method.service(), method.method()) {
-                ("etcdserverpb.Auth", "Authenticate")
-                | ("etcdserverpb.Cluster", "MemberList")
-                | ("etcdserverpb.Lease", _) => {
-                    // Skip adding the token for all Lease methods
-                }
+                ("etcdserverpb.Auth", "Authenticate") | ("etcdserverpb.Cluster", "MemberList") => {}
                 (service, _)
                     if service.starts_with("etcdserverpb")
                         || service.starts_with("v3electionpb")
