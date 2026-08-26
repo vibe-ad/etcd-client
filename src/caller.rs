@@ -30,6 +30,8 @@ pub struct ClientCallerBuilder {
     auth_token: AuthToken,
     auth_client: AuthClient,
     channel: InterceptedChannel,
+    #[cfg(feature = "failover")]
+    retry: crate::failover::RetryConfig,
 }
 
 impl ClientCallerBuilder {
@@ -45,17 +47,36 @@ impl ClientCallerBuilder {
             auth_token,
             auth_client,
             channel,
+            #[cfg(feature = "failover")]
+            retry: crate::failover::RetryConfig::disabled(),
         }
+    }
+
+    /// Installs the failover config every built [`ClientCaller`] inherits.
+    #[cfg(feature = "failover")]
+    pub(crate) fn with_retry(mut self, retry: crate::failover::RetryConfig) -> Self {
+        self.retry = retry;
+        self
+    }
+
+    /// The failover config, for sub-clients that drive their own retry loop.
+    #[cfg(feature = "failover")]
+    pub(crate) fn retry(&self) -> &crate::failover::RetryConfig {
+        &self.retry
     }
 
     /// Build a new [`ClientCaller`] passing an actual client implementation.
     pub fn build<T>(self, f_inner: impl FnOnce(InterceptedChannel) -> T) -> ClientCaller<T> {
-        ClientCaller::new(
+        #[allow(unused_mut)]
+        let mut caller = ClientCaller::new(
             f_inner(self.channel),
             self.auth_client,
             self.auth_token,
             self.options,
-        )
+        );
+        #[cfg(feature = "failover")]
+        caller.set_retry(self.retry);
+        caller
     }
 }
 
@@ -89,17 +110,25 @@ impl<T> ClientCaller<T> {
             auth_client,
             auth_token,
             options,
-            // Placeholder, overwritten by `set_retry` once the endpoint count is
-            // known.
+            // Overwritten by `ClientCallerBuilder::build`, which is how every
+            // caller inside the crate is constructed.
             #[cfg(feature = "failover")]
             retry: crate::failover::RetryConfig::disabled(),
         }
     }
 
-    /// Installs the failover config (called once at client construction).
     #[cfg(feature = "failover")]
-    pub(crate) fn set_retry(&mut self, retry: crate::failover::RetryConfig) {
+    fn set_retry(&mut self, retry: crate::failover::RetryConfig) {
         self.retry = retry;
+    }
+
+    /// Whether credentials are currently installed. Tracks `update_user`, unlike
+    /// the [`ConnectOptions`] copy the client was built from.
+    ///
+    /// [`ConnectOptions`]: `crate::ConnectOptions`
+    #[cfg(feature = "failover")]
+    pub(crate) fn has_creds(&self) -> bool {
+        self.options.creds.read_unpoisoned().is_some()
     }
 
     /// Refresh the authentication token if the client has credentials options.

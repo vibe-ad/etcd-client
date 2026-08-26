@@ -45,17 +45,13 @@ impl LeaseClient {
     /// Creates a `LeaseClient`.
     #[inline]
     pub(crate) fn new(builder: ClientCallerBuilder) -> Self {
+        #[cfg(feature = "failover")]
+        let retry = builder.retry().clone();
         Self {
             inner: builder.build(Client::new),
             #[cfg(feature = "failover")]
-            retry: crate::failover::RetryConfig::disabled(),
+            retry,
         }
-    }
-
-    /// Installs the failover config (called once at client construction).
-    #[cfg(feature = "failover")]
-    pub(crate) fn set_retry(&mut self, retry: crate::failover::RetryConfig) {
-        self.retry = retry;
     }
 
     /// Creates a lease which expires if the server does not receive a keepAlive
