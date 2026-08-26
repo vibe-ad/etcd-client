@@ -98,7 +98,10 @@ etcd-client = { version = "0.19", features = ["failover"] }
 - **Streaming reconnection.** A broken watch stream re-establishes on a healthy
   endpoint and resumes each watch from the revision after the last one delivered.
   A broken lease keep-alive stream re-establishes and resumes renewals.
-- **Auth token refresh.** An expired auth token is refreshed and the call retried.
+- **Auth token refresh.** An expired auth token is refreshed and the call
+  retried, mirroring Go `clientv3`. This is unconditional under `failover`,
+  so `ConnectOptions::with_auto_token_refresh` is ignored: enabling it would
+  only nest a second retry loop and clone every request twice.
 
 Tune via `ConnectOptions`: `with_retries`, `with_retry_backoff`,
 `with_watch_reconnect` and `with_lease_keepalive_reconnect`. The design mirrors

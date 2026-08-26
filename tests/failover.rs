@@ -113,12 +113,12 @@ async fn auth_ops_are_reliable() -> Result<()> {
     let mut client = get_client().await?;
     // Root user + role are required before auth can be enabled. Tolerate them
     // already existing from a prior run.
-    let _ = client.user_add("root", "rootpw", None).await;
+    let _ = client.user_add("root", "rootpwd", None).await;
     let _ = client.role_add("root").await;
     let _ = client.user_grant_role("root", "root").await;
     client.auth_enable().await?;
 
-    let options = ConnectOptions::new().with_user("root", "rootpw");
+    let options = ConnectOptions::new().with_user("root", "rootpwd");
     let mut authed = Client::connect([DEFAULT_TEST_ENDPOINT], Some(options)).await?;
     authed.put("auth-reliability", "v", None).await?;
     let resp = authed.get("auth-reliability", None).await?;
@@ -127,6 +127,50 @@ async fn auth_ops_are_reliable() -> Result<()> {
     // Restore an open cluster for the rest of the suite.
     authed.auth_disable().await?;
     authed.delete("auth-reliability", None).await?;
+    Ok(())
+}
+
+/// Credentials installed after connect are honoured by the reauth path: the
+/// client was built from options carrying no user, so only the live credential
+/// state can tell `run_failover` there is something to refresh. Mutates global
+/// auth state, so it is ignored by default. Run in isolation:
+/// `cargo test --features failover --test failover -- --ignored reauth_after`.
+///
+/// Expects an etcd started with a short `ETCD_AUTH_TOKEN_TTL` (the CI value is
+/// 2s), otherwise the sleep never crosses an expiry and the test is vacuous.
+#[ignore]
+#[tokio::test]
+async fn reauth_after_update_user() -> Result<()> {
+    const TOKEN_TTL: Duration = Duration::from_secs(4);
+
+    let mut admin = get_client().await?;
+    let _ = admin.user_add("root", "rootpwd", None).await;
+    let _ = admin.role_add("root").await;
+    let _ = admin.user_grant_role("root", "root").await;
+    admin.auth_enable().await?;
+
+    // Connect anonymously, then install the credentials. `ConnectOptions::user`
+    // stays `None` for the client's whole life.
+    let mut client = Client::connect([DEFAULT_TEST_ENDPOINT], None).await?;
+    client
+        .update_user(Some(("root".to_string(), "rootpwd".to_string())))
+        .await?;
+    client.put("reauth-after-update", "v", None).await?;
+
+    tokio::time::sleep(TOKEN_TTL).await;
+    let resp = client.get("reauth-after-update", None).await?;
+    assert_eq!(resp.kvs().first().map(|kv| kv.value()), Some(&b"v"[..]));
+
+    // Dropping the credentials must stop the reauth path rather than refresh
+    // back into the stale ones.
+    client.update_user(None).await?;
+    client.get("reauth-after-update", None).await.unwrap_err();
+
+    client
+        .update_user(Some(("root".to_string(), "rootpwd".to_string())))
+        .await?;
+    client.auth_disable().await?;
+    client.delete("reauth-after-update", None).await?;
     Ok(())
 }
 

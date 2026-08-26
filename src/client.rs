@@ -141,7 +141,7 @@ impl Client {
         }
 
         #[cfg(feature = "failover")]
-        let endpoint_count = endpoints.len();
+        let retry = Self::build_retry_config(&options, endpoints.len());
         let auth_token = Arc::new(RwLock::new(None));
 
         // Always use balance strategy even if there is only one endpoint.
@@ -163,9 +163,14 @@ impl Client {
                 })?;
         }
 
-        let client = Self::build_client(channel, Some(tx), auth_token, options);
-        #[cfg(feature = "failover")]
-        let client = client.with_retry_config(endpoint_count);
+        let client = Self::build_client(
+            channel,
+            Some(tx),
+            auth_token,
+            options,
+            #[cfg(feature = "failover")]
+            retry,
+        );
         client.refresh_token().await?;
         Ok(client)
     }
@@ -183,11 +188,18 @@ impl Client {
             },
         );
 
-        let client = Self::build_client(channel, None, auth_token, options);
         // A raw channel has no managed endpoint list, so pace retries as if
         // single-endpoint. Failover still works if the channel is balanced.
         #[cfg(feature = "failover")]
-        let client = client.with_retry_config(1);
+        let retry = Self::build_retry_config(&options, 1);
+        let client = Self::build_client(
+            channel,
+            None,
+            auth_token,
+            options,
+            #[cfg(feature = "failover")]
+            retry,
+        );
         client.refresh_token().await?;
         Ok(client)
     }
@@ -281,10 +293,15 @@ impl Client {
         tx: Option<Sender<Change<Uri, Endpoint>>>,
         auth_token: Arc<RwLock<Option<MetadataValue<Ascii>>>>,
         options: ConnectOptions,
+        #[cfg(feature = "failover")] retry: crate::failover::RetryConfig,
     ) -> Self {
         let auth = AuthClient::new(channel.clone());
         let builder =
             ClientCallerBuilder::new((&options).into(), auth_token, auth.clone(), channel);
+        // Every caller the builder produces inherits the config, so the
+        // re-authentication RPC fails over from any sub-client too.
+        #[cfg(feature = "failover")]
+        let builder = builder.with_retry(retry.clone());
 
         let kv = KvClient::new(builder.clone());
         let watch = WatchClient::new(builder.clone());
@@ -306,43 +323,33 @@ impl Client {
             options,
             tx,
             client_caller: builder.build(|_| ()),
-            // Placeholder, overwritten by `with_retry_config` once the endpoint
-            // count is known.
             #[cfg(feature = "failover")]
-            retry: crate::failover::RetryConfig::disabled(),
+            retry,
         }
     }
 
-    /// Builds the retry config from options and endpoint count, then stores it.
+    /// Derives the retry config from options and the endpoint count.
     #[cfg(feature = "failover")]
-    fn with_retry_config(mut self, endpoint_count: usize) -> Self {
-        let max_attempts = self
-            .options
+    fn build_retry_config(
+        options: &ConnectOptions,
+        endpoint_count: usize,
+    ) -> crate::failover::RetryConfig {
+        let max_attempts = options
             .max_retries
             .unwrap_or_else(|| ((2 * endpoint_count).max(5)) as u32);
-        let (wait, jitter) = self
-            .options
+        let (wait, jitter) = options
             .retry_backoff
             .unwrap_or((Duration::from_millis(25), 0.10));
         // Stream auto-reconnect defaults on whenever retry is on.
         let retry_on = max_attempts > 1;
-        let watch_reconnect = self.options.watch_reconnect.unwrap_or(retry_on);
-        let lease_reconnect = self.options.lease_keepalive_reconnect.unwrap_or(retry_on);
-        let retry = crate::failover::RetryConfig::new(
+        crate::failover::RetryConfig::new(
             max_attempts,
             wait,
             jitter,
             endpoint_count,
-            watch_reconnect,
-            lease_reconnect,
-        );
-        // Streaming reconnection lives in the watch/lease sub-clients, and the
-        // caller owns the re-authentication RPC, so all three need the config.
-        self.watch.set_retry(retry.clone());
-        self.lease.set_retry(retry.clone());
-        self.client_caller.set_retry(retry.clone());
-        self.retry = retry;
-        self
+            options.watch_reconnect.unwrap_or(retry_on),
+            options.lease_keepalive_reconnect.unwrap_or(retry_on),
+        )
     }
 
     /// Run a unary operation with retry/failover according to `policy`,
@@ -373,7 +380,7 @@ impl Client {
                     Decision::RefreshToken => {
                         // Without credentials there is nothing to refresh, so
                         // retrying the same auth error would just burn the budget.
-                        if self.options.user.is_none() {
+                        if !self.client_caller.has_creds() {
                             return Err(e);
                         }
                         tracing::warn!(
@@ -424,7 +431,10 @@ impl Client {
         };
         tx.send(Change::Insert(endpoint.uri().clone(), endpoint))
             .await
-            .map_err(|e| Error::EndpointError(format!("failed to add endpoint because of {e}")))
+            .map_err(|e| Error::EndpointError(format!("failed to add endpoint because of {e}")))?;
+        #[cfg(feature = "failover")]
+        self.retry.endpoint_added();
+        Ok(())
     }
 
     /// Dynamically remove an endpoint from the client.
@@ -438,9 +448,12 @@ impl Client {
         let Some(tx) = &self.tx else {
             return Err(Error::EndpointsNotManaged);
         };
-        tx.send(Change::Remove(uri))
-            .await
-            .map_err(|e| Error::EndpointError(format!("failed to remove endpoint because of {e}")))
+        tx.send(Change::Remove(uri)).await.map_err(|e| {
+            Error::EndpointError(format!("failed to remove endpoint because of {e}"))
+        })?;
+        #[cfg(feature = "failover")]
+        self.retry.endpoint_removed();
+        Ok(())
     }
 
     /// Gets a KV client.
@@ -1061,6 +1074,9 @@ impl ConnectOptions {
     /// Whether to automatically refresh the authentication token when the current
     /// token has expired. Note that, when this feature is enabled, each request is
     /// *CLONED* so that it can be retried.
+    ///
+    /// Ignored under the `failover` feature, which always renews an expired token
+    /// and retries the call.
     pub fn with_auto_token_refresh(mut self, refresh_expired_token: bool) -> Self {
         self.refresh_expired_token = refresh_expired_token;
         self
@@ -1159,6 +1175,12 @@ impl From<&ConnectOptions> for CallOptions {
     fn from(options: &ConnectOptions) -> Self {
         Self {
             creds: Arc::new(RwLock::new(options.user.clone())),
+            // `run_failover` already re-authenticates on any auth-token error,
+            // so leaving the per-call refresh on would nest a second retry loop
+            // and clone every request twice.
+            #[cfg(feature = "failover")]
+            refresh_expired_token: false,
+            #[cfg(not(feature = "failover"))]
             refresh_expired_token: options.refresh_expired_token,
         }
     }

@@ -9,6 +9,8 @@
 
 use crate::error::Error;
 use std::error::Error as StdError;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use tonic::{Code, Status};
 
@@ -37,8 +39,9 @@ pub(crate) struct RetryConfig {
     backoff_wait: Duration,
     /// Jitter as a fraction of `backoff_wait` (e.g. 0.10 for +/-10%).
     jitter: f64,
-    /// Endpoint count, used to pace backoff by quorum.
-    endpoint_count: usize,
+    /// Live endpoint count, used to pace backoff by quorum. Shared with every
+    /// clone so `add_endpoint` / `remove_endpoint` re-pace the whole client.
+    endpoint_count: Arc<AtomicUsize>,
     /// Auto-reconnect a broken watch stream, resuming from the last revision.
     pub(crate) watch_reconnect: bool,
     /// Auto-reconnect a broken lease keep-alive stream.
@@ -58,7 +61,7 @@ impl RetryConfig {
             max_attempts,
             backoff_wait,
             jitter,
-            endpoint_count: endpoint_count.max(1),
+            endpoint_count: Arc::new(AtomicUsize::new(endpoint_count.max(1))),
             watch_reconnect,
             lease_reconnect,
         }
@@ -76,12 +79,27 @@ impl RetryConfig {
         if attempt == 0 {
             return Duration::ZERO;
         }
-        let quorum = (self.endpoint_count / 2 + 1) as u32;
+        let quorum = (self.endpoint_count.load(Ordering::Relaxed) / 2 + 1) as u32;
         if attempt % quorum == 0 {
             jittered(self.backoff_wait, self.jitter)
         } else {
             Duration::ZERO
         }
+    }
+
+    /// Tracks a successful `add_endpoint`, so backoff paces against the live
+    /// endpoint count. `max_attempts` stays as derived at connect time.
+    pub(crate) fn endpoint_added(&self) {
+        self.endpoint_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Tracks a successful `remove_endpoint`, never dropping below one.
+    pub(crate) fn endpoint_removed(&self) {
+        let _ = self
+            .endpoint_count
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                (n > 1).then(|| n - 1)
+            });
     }
 
     /// Backoff for a stream reconnect attempt: exponential from `backoff_wait`,
@@ -313,6 +331,32 @@ mod tests {
         // The shift saturates at 8 and the result is capped at 5s.
         assert_eq!(cfg.reconnect_backoff(8), Duration::from_secs(5));
         assert_eq!(cfg.reconnect_backoff(100), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn backoff_tracks_live_endpoint_count() {
+        let cfg = RetryConfig::new(10, Duration::from_millis(25), 0.0, 1, false, false);
+        // Quorum of 1: every retry pauses.
+        assert_eq!(cfg.backoff(1), Duration::from_millis(25));
+        cfg.endpoint_added();
+        cfg.endpoint_added();
+        // Quorum of 2: the odd attempts sweep, the even ones pause.
+        assert_eq!(cfg.backoff(1), Duration::ZERO);
+        assert_eq!(cfg.backoff(2), Duration::from_millis(25));
+        cfg.endpoint_removed();
+        cfg.endpoint_removed();
+        // Clamped at one, so the pacing is back to pausing on every retry.
+        cfg.endpoint_removed();
+        assert_eq!(cfg.backoff(1), Duration::from_millis(25));
+    }
+
+    #[test]
+    fn endpoint_count_is_shared_across_clones() {
+        let cfg = RetryConfig::new(10, Duration::from_millis(25), 0.0, 1, false, false);
+        let clone = cfg.clone();
+        cfg.endpoint_added();
+        cfg.endpoint_added();
+        assert_eq!(clone.backoff(1), Duration::ZERO);
     }
 
     #[test]
