@@ -423,11 +423,16 @@ async fn test_auth_refresh_token() -> Result<()> {
 
     let mut client = get_auth_client(None).await?;
     tokio::time::sleep(TOKEN_TTL).await;
-    // Must expire.
+    // Must expire. Under `failover` the client re-authenticates on any auth-token
+    // error regardless of `with_auto_token_refresh`, mirroring etcd's Go
+    // clientv3, so an expired token is transparently renewed instead.
+    #[cfg(not(feature = "failover"))]
     client
         .get("key", None)
         .await
         .expect_err(&format!("The test expects that token TTL <= {TOKEN_TTL:?}"));
+    #[cfg(feature = "failover")]
+    client.get("key", None).await?;
 
     let options = Some(ConnectOptions::new().with_auto_token_refresh(true));
 
