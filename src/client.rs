@@ -56,6 +56,28 @@ const HTTPS_PREFIX: &str = "https://";
 
 pub(crate) type AuthToken = Arc<RwLock<Option<MetadataValue<Ascii>>>>;
 
+/// Dispatch a unary sub-client call. With the `failover` feature it retries via
+/// [`Client::run_failover`], cloning the sub-client and (owned, `Clone`)
+/// arguments per attempt so the request is replayable. Without it, a plain call.
+macro_rules! failover {
+    ($self:ident, $policy:ident, $sub:ident, $m:ident $(, $a:ident)*) => {{
+        #[cfg(not(feature = "failover"))]
+        {
+            $self.$sub.$m($($a),*).await
+        }
+        #[cfg(feature = "failover")]
+        {
+            $self
+                .run_failover(crate::failover::RetryPolicy::$policy, || {
+                    let mut client = $self.$sub.clone();
+                    $(let $a = $a.clone();)*
+                    async move { client.$m($($a),*).await }
+                })
+                .await
+        }
+    }};
+}
+
 /// Asynchronous `etcd` client using v3 API.
 #[derive(Clone)]
 pub struct Client {
@@ -72,6 +94,8 @@ pub struct Client {
     options: ConnectOptions,
     tx: Option<Sender<Change<Uri, Endpoint>>>,
     client_caller: ClientCaller<()>,
+    #[cfg(feature = "failover")]
+    retry: crate::failover::RetryConfig,
 }
 
 impl Client {
@@ -116,6 +140,8 @@ impl Client {
             return Err(Error::InvalidArgs(String::from("empty endpoints")));
         }
 
+        #[cfg(feature = "failover")]
+        let retry = Self::build_retry_config(&options, endpoints.len());
         let auth_token = Arc::new(RwLock::new(None));
 
         // Always use balance strategy even if there is only one endpoint.
@@ -137,7 +163,14 @@ impl Client {
                 })?;
         }
 
-        let client = Self::build_client(channel, Some(tx), auth_token, options);
+        let client = Self::build_client(
+            channel,
+            Some(tx),
+            auth_token,
+            options,
+            #[cfg(feature = "failover")]
+            retry,
+        );
         client.refresh_token().await?;
         Ok(client)
     }
@@ -155,7 +188,18 @@ impl Client {
             },
         );
 
-        let client = Self::build_client(channel, None, auth_token, options);
+        // A raw channel has no managed endpoint list, so pace retries as if
+        // single-endpoint. Failover still works if the channel is balanced.
+        #[cfg(feature = "failover")]
+        let retry = Self::build_retry_config(&options, 1);
+        let client = Self::build_client(
+            channel,
+            None,
+            auth_token,
+            options,
+            #[cfg(feature = "failover")]
+            retry,
+        );
         client.refresh_token().await?;
         Ok(client)
     }
@@ -249,10 +293,15 @@ impl Client {
         tx: Option<Sender<Change<Uri, Endpoint>>>,
         auth_token: Arc<RwLock<Option<MetadataValue<Ascii>>>>,
         options: ConnectOptions,
+        #[cfg(feature = "failover")] retry: crate::failover::RetryConfig,
     ) -> Self {
         let auth = AuthClient::new(channel.clone());
         let builder =
             ClientCallerBuilder::new((&options).into(), auth_token, auth.clone(), channel);
+        // Every caller the builder produces inherits the config, so the
+        // re-authentication RPC fails over from any sub-client too.
+        #[cfg(feature = "failover")]
+        let builder = builder.with_retry(retry.clone());
 
         let kv = KvClient::new(builder.clone());
         let watch = WatchClient::new(builder.clone());
@@ -274,7 +323,94 @@ impl Client {
             options,
             tx,
             client_caller: builder.build(|_| ()),
+            #[cfg(feature = "failover")]
+            retry,
         }
+    }
+
+    /// Derives the retry config from options and the endpoint count.
+    #[cfg(feature = "failover")]
+    fn build_retry_config(
+        options: &ConnectOptions,
+        endpoint_count: usize,
+    ) -> crate::failover::RetryConfig {
+        let max_attempts = options
+            .max_retries
+            .unwrap_or_else(|| ((2 * endpoint_count).max(5)) as u32);
+        let (wait, jitter) = options
+            .retry_backoff
+            .unwrap_or((Duration::from_millis(25), 0.10));
+        // Stream auto-reconnect defaults on whenever retry is on.
+        let retry_on = max_attempts > 1;
+        crate::failover::RetryConfig::new(
+            max_attempts,
+            wait,
+            jitter,
+            endpoint_count,
+            options.watch_reconnect.unwrap_or(retry_on),
+            options.lease_keepalive_reconnect.unwrap_or(retry_on),
+        )
+    }
+
+    /// Run a unary operation with retry/failover according to `policy`,
+    /// re-authenticating on token expiry. A no-op wrapper when retry is
+    /// disabled (single attempt).
+    #[cfg(feature = "failover")]
+    async fn run_failover<T, F, Fut>(
+        &self,
+        policy: crate::failover::RetryPolicy,
+        mut op: F,
+    ) -> Result<T>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        use crate::failover::Decision;
+        let cfg = &self.retry;
+        let max = cfg.max_attempts.max(1);
+        let mut last: Option<Error> = None;
+        for attempt in 0..max {
+            let wait = cfg.backoff(attempt);
+            if !wait.is_zero() {
+                tokio::time::sleep(wait).await;
+            }
+            match op().await {
+                Ok(v) => return Ok(v),
+                Err(e) => match crate::failover::classify(&e, policy) {
+                    Decision::RefreshToken => {
+                        // Without credentials there is nothing to refresh, so
+                        // retrying the same auth error would just burn the budget.
+                        if !self.client_caller.has_creds() {
+                            return Err(e);
+                        }
+                        tracing::warn!(
+                            target: "etcd_client::failover",
+                            attempt = attempt + 1,
+                            max,
+                            error = %e,
+                            "etcd auth token rejected, refreshing and retrying",
+                        );
+                        // Reauth is best-effort: a refresh that itself fails (for
+                        // example it hit the down endpoint) must not mask the
+                        // original error, so keep it and let the budget continue.
+                        let _ = self.refresh_token().await;
+                        last = Some(e);
+                    }
+                    Decision::Retry => {
+                        tracing::warn!(
+                            target: "etcd_client::failover",
+                            attempt = attempt + 1,
+                            max,
+                            error = %e,
+                            "etcd unary RPC failed, failing over to another endpoint",
+                        );
+                        last = Some(e);
+                    }
+                    Decision::Stop => return Err(e),
+                },
+            }
+        }
+        Err(last.expect("retry loop runs at least once"))
     }
 
     /// Dynamically add an endpoint to the client.
@@ -295,7 +431,10 @@ impl Client {
         };
         tx.send(Change::Insert(endpoint.uri().clone(), endpoint))
             .await
-            .map_err(|e| Error::EndpointError(format!("failed to add endpoint because of {e}")))
+            .map_err(|e| Error::EndpointError(format!("failed to add endpoint because of {e}")))?;
+        #[cfg(feature = "failover")]
+        self.retry.endpoint_added();
+        Ok(())
     }
 
     /// Dynamically remove an endpoint from the client.
@@ -309,9 +448,12 @@ impl Client {
         let Some(tx) = &self.tx else {
             return Err(Error::EndpointsNotManaged);
         };
-        tx.send(Change::Remove(uri))
-            .await
-            .map_err(|e| Error::EndpointError(format!("failed to remove endpoint because of {e}")))
+        tx.send(Change::Remove(uri)).await.map_err(|e| {
+            Error::EndpointError(format!("failed to remove endpoint because of {e}"))
+        })?;
+        #[cfg(feature = "failover")]
+        self.retry.endpoint_removed();
+        Ok(())
     }
 
     /// Gets a KV client.
@@ -372,7 +514,8 @@ impl Client {
         value: impl Into<Vec<u8>>,
         options: Option<PutOptions>,
     ) -> Result<PutResponse> {
-        self.kv.put(key, value, options).await
+        let (key, value) = (key.into(), value.into());
+        failover!(self, NonRepeatable, kv, put, key, value, options)
     }
 
     /// Gets the key from the key-value store.
@@ -382,7 +525,8 @@ impl Client {
         key: impl Into<Vec<u8>>,
         options: Option<GetOptions>,
     ) -> Result<GetResponse> {
-        self.kv.get(key, options).await
+        let key = key.into();
+        failover!(self, Repeatable, kv, get, key, options)
     }
 
     /// Deletes the given key from the key-value store.
@@ -392,7 +536,8 @@ impl Client {
         key: impl Into<Vec<u8>>,
         options: Option<DeleteOptions>,
     ) -> Result<DeleteResponse> {
-        self.kv.delete(key, options).await
+        let key = key.into();
+        failover!(self, NonRepeatable, kv, delete, key, options)
     }
 
     /// Compacts the event history in the etcd key-value store. The key-value
@@ -404,7 +549,7 @@ impl Client {
         revision: i64,
         options: Option<CompactionOptions>,
     ) -> Result<CompactionResponse> {
-        self.kv.compact(revision, options).await
+        failover!(self, NonRepeatable, kv, compact, revision, options)
     }
 
     /// Processes multiple operations in a single transaction.
@@ -413,7 +558,7 @@ impl Client {
     /// It is not allowed to modify the same key several times within one txn.
     #[inline]
     pub async fn txn(&mut self, txn: Txn) -> Result<TxnResponse> {
-        self.kv.txn(txn).await
+        failover!(self, NonRepeatable, kv, txn, txn)
     }
 
     /// Watches for events happening or that have happened. Both input and output
@@ -438,13 +583,13 @@ impl Client {
         ttl: i64,
         options: Option<LeaseGrantOptions>,
     ) -> Result<LeaseGrantResponse> {
-        self.lease.grant(ttl, options).await
+        failover!(self, Repeatable, lease, grant, ttl, options)
     }
 
     /// Revokes a lease. All keys attached to the lease will expire and be deleted.
     #[inline]
     pub async fn lease_revoke(&mut self, id: i64) -> Result<LeaseRevokeResponse> {
-        self.lease.revoke(id).await
+        failover!(self, Repeatable, lease, revoke, id)
     }
 
     /// Keeps the lease alive by streaming keep alive requests from the client
@@ -464,13 +609,13 @@ impl Client {
         id: i64,
         options: Option<LeaseTimeToLiveOptions>,
     ) -> Result<LeaseTimeToLiveResponse> {
-        self.lease.time_to_live(id, options).await
+        failover!(self, Repeatable, lease, time_to_live, id, options)
     }
 
     /// Lists all existing leases.
     #[inline]
     pub async fn leases(&mut self) -> Result<LeaseLeasesResponse> {
-        self.lease.leases().await
+        failover!(self, Repeatable, lease, leases)
     }
 
     /// Lock acquires a distributed shared lock on a given named lock.
@@ -485,7 +630,8 @@ impl Client {
         name: impl Into<Vec<u8>>,
         options: Option<LockOptions>,
     ) -> Result<LockResponse> {
-        self.lock.lock(name, options).await
+        let name = name.into();
+        failover!(self, NonRepeatable, lock, lock, name, options)
     }
 
     /// Unlock takes a key returned by Lock and releases the hold on lock. The
@@ -493,43 +639,47 @@ impl Client {
     /// ownership of the lock.
     #[inline]
     pub async fn unlock(&mut self, key: impl Into<Vec<u8>>) -> Result<UnlockResponse> {
-        self.lock.unlock(key).await
+        let key = key.into();
+        failover!(self, Repeatable, lock, unlock, key)
     }
 
     /// Enables authentication.
     #[inline]
     pub async fn auth_enable(&mut self) -> Result<AuthEnableResponse> {
-        self.auth.auth_enable().await
+        failover!(self, NonRepeatable, auth, auth_enable)
     }
 
     /// Disables authentication.
     #[inline]
     pub async fn auth_disable(&mut self) -> Result<AuthDisableResponse> {
-        self.auth.auth_disable().await
+        failover!(self, NonRepeatable, auth, auth_disable)
     }
 
     /// Adds role.
     #[inline]
     pub async fn role_add(&mut self, name: impl Into<String>) -> Result<RoleAddResponse> {
-        self.auth.role_add(name).await
+        let name = name.into();
+        failover!(self, NonRepeatable, auth, role_add, name)
     }
 
     /// Deletes role.
     #[inline]
     pub async fn role_delete(&mut self, name: impl Into<String>) -> Result<RoleDeleteResponse> {
-        self.auth.role_delete(name).await
+        let name = name.into();
+        failover!(self, NonRepeatable, auth, role_delete, name)
     }
 
     /// Gets role.
     #[inline]
     pub async fn role_get(&mut self, name: impl Into<String>) -> Result<RoleGetResponse> {
-        self.auth.role_get(name).await
+        let name = name.into();
+        failover!(self, Repeatable, auth, role_get, name)
     }
 
     /// Lists role.
     #[inline]
     pub async fn role_list(&mut self) -> Result<RoleListResponse> {
-        self.auth.role_list().await
+        failover!(self, Repeatable, auth, role_list)
     }
 
     /// Grants role permission.
@@ -539,7 +689,8 @@ impl Client {
         name: impl Into<String>,
         perm: Permission,
     ) -> Result<RoleGrantPermissionResponse> {
-        self.auth.role_grant_permission(name, perm).await
+        let name = name.into();
+        failover!(self, NonRepeatable, auth, role_grant_permission, name, perm)
     }
 
     /// Revokes role permission.
@@ -550,7 +701,16 @@ impl Client {
         key: impl Into<Vec<u8>>,
         options: Option<RoleRevokePermissionOptions>,
     ) -> Result<RoleRevokePermissionResponse> {
-        self.auth.role_revoke_permission(name, key, options).await
+        let (name, key) = (name.into(), key.into());
+        failover!(
+            self,
+            NonRepeatable,
+            auth,
+            role_revoke_permission,
+            name,
+            key,
+            options
+        )
     }
 
     /// Add an user.
@@ -561,25 +721,28 @@ impl Client {
         password: impl Into<String>,
         options: Option<UserAddOptions>,
     ) -> Result<UserAddResponse> {
-        self.auth.user_add(name, password, options).await
+        let (name, password) = (name.into(), password.into());
+        failover!(self, NonRepeatable, auth, user_add, name, password, options)
     }
 
     /// Gets the user info by the user name.
     #[inline]
     pub async fn user_get(&mut self, name: impl Into<String>) -> Result<UserGetResponse> {
-        self.auth.user_get(name).await
+        let name = name.into();
+        failover!(self, Repeatable, auth, user_get, name)
     }
 
     /// Lists all users.
     #[inline]
     pub async fn user_list(&mut self) -> Result<UserListResponse> {
-        self.auth.user_list().await
+        failover!(self, Repeatable, auth, user_list)
     }
 
     /// Deletes the given key from the key-value store.
     #[inline]
     pub async fn user_delete(&mut self, name: impl Into<String>) -> Result<UserDeleteResponse> {
-        self.auth.user_delete(name).await
+        let name = name.into();
+        failover!(self, NonRepeatable, auth, user_delete, name)
     }
 
     /// Change password for an user.
@@ -589,7 +752,15 @@ impl Client {
         name: impl Into<String>,
         password: impl Into<String>,
     ) -> Result<UserChangePasswordResponse> {
-        self.auth.user_change_password(name, password).await
+        let (name, password) = (name.into(), password.into());
+        failover!(
+            self,
+            NonRepeatable,
+            auth,
+            user_change_password,
+            name,
+            password
+        )
     }
 
     /// Grant role for an user.
@@ -599,7 +770,8 @@ impl Client {
         user: impl Into<String>,
         role: impl Into<String>,
     ) -> Result<UserGrantRoleResponse> {
-        self.auth.user_grant_role(user, role).await
+        let (user, role) = (user.into(), role.into());
+        failover!(self, NonRepeatable, auth, user_grant_role, user, role)
     }
 
     /// Revoke role for an user.
@@ -609,7 +781,8 @@ impl Client {
         user: impl Into<String>,
         role: impl Into<String>,
     ) -> Result<UserRevokeRoleResponse> {
-        self.auth.user_revoke_role(user, role).await
+        let (user, role) = (user.into(), role.into());
+        failover!(self, NonRepeatable, auth, user_revoke_role, user, role)
     }
 
     /// Maintain(get, active or inactive) alarms of members.
@@ -620,21 +793,27 @@ impl Client {
         alarm_type: AlarmType,
         options: Option<AlarmOptions>,
     ) -> Result<AlarmResponse> {
-        self.maintenance
-            .alarm(alarm_action, alarm_type, options)
-            .await
+        failover!(
+            self,
+            Repeatable,
+            maintenance,
+            alarm,
+            alarm_action,
+            alarm_type,
+            options
+        )
     }
 
     /// Gets the status of a member.
     #[inline]
     pub async fn status(&mut self) -> Result<StatusResponse> {
-        self.maintenance.status().await
+        failover!(self, Repeatable, maintenance, status)
     }
 
     /// Defragments a member's backend database to recover storage space.
     #[inline]
     pub async fn defragment(&mut self) -> Result<DefragmentResponse> {
-        self.maintenance.defragment().await
+        failover!(self, NonRepeatable, maintenance, defragment)
     }
 
     /// Computes the hash of whole backend keyspace.
@@ -642,20 +821,21 @@ impl Client {
     /// This is designed for testing ONLY!
     #[inline]
     pub async fn hash(&mut self) -> Result<HashResponse> {
-        self.maintenance.hash().await
+        failover!(self, Repeatable, maintenance, hash)
     }
 
     /// Computes the hash of all MVCC keys up to a given revision.
     /// It only iterates \"key\" bucket in backend storage.
     #[inline]
     pub async fn hash_kv(&mut self, revision: i64) -> Result<HashKvResponse> {
-        self.maintenance.hash_kv(revision).await
+        failover!(self, Repeatable, maintenance, hash_kv, revision)
     }
 
     /// Gets a snapshot of the entire backend from a member over a stream to a client.
+    /// Only the stream establishment is retried under `failover`.
     #[inline]
     pub async fn snapshot(&mut self) -> Result<SnapshotStreaming> {
-        self.maintenance.snapshot().await
+        failover!(self, Repeatable, maintenance, snapshot)
     }
 
     /// Adds current connected server as a member.
@@ -675,14 +855,13 @@ impl Client {
             };
             eps.push(url);
         }
-
-        self.cluster.member_add(eps, options).await
+        failover!(self, NonRepeatable, cluster, member_add, eps, options)
     }
 
     /// Remove a member.
     #[inline]
     pub async fn member_remove(&mut self, id: u64) -> Result<MemberRemoveResponse> {
-        self.cluster.member_remove(id).await
+        failover!(self, NonRepeatable, cluster, member_remove, id)
     }
 
     /// Updates the member.
@@ -692,25 +871,26 @@ impl Client {
         id: u64,
         url: impl Into<Vec<String>>,
     ) -> Result<MemberUpdateResponse> {
-        self.cluster.member_update(id, url).await
+        let url = url.into();
+        failover!(self, NonRepeatable, cluster, member_update, id, url)
     }
 
     /// Promotes the member.
     #[inline]
     pub async fn member_promote(&mut self, id: u64) -> Result<MemberPromoteResponse> {
-        self.cluster.member_promote(id).await
+        failover!(self, NonRepeatable, cluster, member_promote, id)
     }
 
     /// Lists members.
     #[inline]
     pub async fn member_list(&mut self) -> Result<MemberListResponse> {
-        self.cluster.member_list().await
+        failover!(self, Repeatable, cluster, member_list)
     }
 
     /// Moves the current leader node to target node.
     #[inline]
     pub async fn move_leader(&mut self, target_id: u64) -> Result<MoveLeaderResponse> {
-        self.maintenance.move_leader(target_id).await
+        failover!(self, Repeatable, maintenance, move_leader, target_id)
     }
 
     /// Puts a value as eligible for the election on the prefix key.
@@ -723,7 +903,8 @@ impl Client {
         value: impl Into<Vec<u8>>,
         lease: i64,
     ) -> Result<CampaignResponse> {
-        self.election.campaign(name, value, lease).await
+        let (name, value) = (name.into(), value.into());
+        failover!(self, NonRepeatable, election, campaign, name, value, lease)
     }
 
     /// Lets the leader announce a new value without another election.
@@ -733,26 +914,29 @@ impl Client {
         value: impl Into<Vec<u8>>,
         options: Option<ProclaimOptions>,
     ) -> Result<ProclaimResponse> {
-        self.election.proclaim(value, options).await
+        let value = value.into();
+        failover!(self, NonRepeatable, election, proclaim, value, options)
     }
 
     /// Returns the leader value for the current election.
     #[inline]
     pub async fn leader(&mut self, name: impl Into<Vec<u8>>) -> Result<LeaderResponse> {
-        self.election.leader(name).await
+        let name = name.into();
+        failover!(self, Repeatable, election, leader, name)
     }
 
     /// Returns a channel that reliably observes ordered leader proposals
     /// as GetResponse values on every current elected leader key.
     #[inline]
     pub async fn observe(&mut self, name: impl Into<Vec<u8>>) -> Result<ObserveStream> {
-        self.election.observe(name).await
+        let name = name.into();
+        failover!(self, Repeatable, election, observe, name)
     }
 
     /// Releases election leadership and then start a new election
     #[inline]
     pub async fn resign(&mut self, option: Option<ResignOptions>) -> Result<ResignResponse> {
-        self.election.resign(option).await
+        failover!(self, NonRepeatable, election, resign, option)
     }
 
     /// Refresh the authentication token if the client has credentials options.
@@ -795,6 +979,18 @@ pub struct ConnectOptions {
     require_leader: bool,
     /// Automatically refresh the authentication token on expiration.
     refresh_expired_token: bool,
+    /// Max total attempts per unary RPC. `None` derives from the endpoint count.
+    #[cfg(feature = "failover")]
+    max_retries: Option<u32>,
+    /// Base wait and jitter fraction between retry rounds.
+    #[cfg(feature = "failover")]
+    retry_backoff: Option<(Duration, f64)>,
+    /// Auto-reconnect a broken watch stream. Defaults to the retry-enabled state.
+    #[cfg(feature = "failover")]
+    watch_reconnect: Option<bool>,
+    /// Auto-reconnect a broken lease keep-alive stream. Defaults likewise.
+    #[cfg(feature = "failover")]
+    lease_keepalive_reconnect: Option<bool>,
 }
 
 impl ConnectOptions {
@@ -878,8 +1074,72 @@ impl ConnectOptions {
     /// Whether to automatically refresh the authentication token when the current
     /// token has expired. Note that, when this feature is enabled, each request is
     /// *CLONED* so that it can be retried.
+    ///
+    /// Ignored under the `failover` feature, which always renews an expired token
+    /// and retries the call.
     pub fn with_auto_token_refresh(mut self, refresh_expired_token: bool) -> Self {
         self.refresh_expired_token = refresh_expired_token;
+        self
+    }
+
+    /// Sets the maximum number of attempts per unary RPC, counting the first
+    /// try. On failure the client fails over to another endpoint. `0` or `1`
+    /// disables retry. When unset, a default is derived from the endpoint count.
+    ///
+    /// Mutating RPCs are only retried when the request provably never reached a
+    /// server, preserving write-at-most-once.
+    ///
+    /// Worst-case latency is about `max_attempts` times the per-request timeout
+    /// plus backoff. The loop cannot interrupt a hung attempt, so pair failover
+    /// with [`ConnectOptions::with_timeout`] to bound each try, otherwise a
+    /// black-holed endpoint can stall the whole retry budget.
+    #[cfg_attr(docsrs, doc(cfg(feature = "failover")))]
+    #[cfg(feature = "failover")]
+    #[inline]
+    pub fn with_retries(mut self, max_attempts: u32) -> Self {
+        self.max_retries = Some(max_attempts);
+        self
+    }
+
+    /// Sets the base wait and jitter fraction between retry rounds. Defaults to
+    /// 25ms and 0.10. Backoff is applied once per quorum of attempts so retries
+    /// sweep a quorum of endpoints quickly, then pause.
+    #[cfg_attr(docsrs, doc(cfg(feature = "failover")))]
+    #[cfg(feature = "failover")]
+    #[inline]
+    pub fn with_retry_backoff(mut self, wait: Duration, jitter_fraction: f64) -> Self {
+        self.retry_backoff = Some((wait, jitter_fraction));
+        self
+    }
+
+    /// Enables or disables transparent watch-stream reconnection (default: on
+    /// while retry is on). A broken watch resumes each active watch from the
+    /// revision after the last one delivered.
+    ///
+    /// The reconnection task stops once no watches remain, so a `WatchStream`
+    /// whose watches are all cancelled must be re-created rather than reused if
+    /// a new watch is needed after a disconnect.
+    #[cfg_attr(docsrs, doc(cfg(feature = "failover")))]
+    #[cfg(feature = "failover")]
+    #[inline]
+    pub fn with_watch_reconnect(mut self, enabled: bool) -> Self {
+        self.watch_reconnect = Some(enabled);
+        self
+    }
+
+    /// Enables or disables transparent lease keep-alive reconnection (default:
+    /// on while retry is on). A lease that expired during an outage surfaces as
+    /// a `ttl <= 0` response.
+    ///
+    /// Reconnection re-primes the lease when the stream is re-established, but
+    /// renewal cadence stays driven by the caller pumping
+    /// [`LeaseKeeper::keep_alive`]. The client does not auto-renew, nor reap a
+    /// lease that expires while the stream itself stays healthy.
+    #[cfg_attr(docsrs, doc(cfg(feature = "failover")))]
+    #[cfg(feature = "failover")]
+    #[inline]
+    pub fn with_lease_keepalive_reconnect(mut self, enabled: bool) -> Self {
+        self.lease_keepalive_reconnect = Some(enabled);
         self
     }
 
@@ -899,6 +1159,14 @@ impl ConnectOptions {
             otls: None,
             require_leader: false,
             refresh_expired_token: false,
+            #[cfg(feature = "failover")]
+            max_retries: None,
+            #[cfg(feature = "failover")]
+            retry_backoff: None,
+            #[cfg(feature = "failover")]
+            watch_reconnect: None,
+            #[cfg(feature = "failover")]
+            lease_keepalive_reconnect: None,
         }
     }
 }
@@ -907,6 +1175,12 @@ impl From<&ConnectOptions> for CallOptions {
     fn from(options: &ConnectOptions) -> Self {
         Self {
             creds: Arc::new(RwLock::new(options.user.clone())),
+            // `run_failover` already re-authenticates on any auth-token error,
+            // so leaving the per-call refresh on would nest a second retry loop
+            // and clone every request twice.
+            #[cfg(feature = "failover")]
+            refresh_expired_token: false,
+            #[cfg(not(feature = "failover"))]
             refresh_expired_token: options.refresh_expired_token,
         }
     }

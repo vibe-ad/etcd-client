@@ -21,19 +21,32 @@ use tonic::Streaming;
 
 type Client = PbWatchClient<InterceptedChannel>;
 
+#[cfg(feature = "failover")]
+use crate::failover::RetryConfig;
+#[cfg(feature = "failover")]
+use std::collections::{HashMap, HashSet};
+#[cfg(feature = "failover")]
+use tokio::sync::mpsc::Receiver;
+
 /// Client for watch operations.
-#[repr(transparent)]
+#[cfg_attr(not(feature = "failover"), repr(transparent))]
 #[derive(Clone)]
 pub struct WatchClient {
     inner: ClientCaller<Client>,
+    #[cfg(feature = "failover")]
+    retry: crate::failover::RetryConfig,
 }
 
 impl WatchClient {
     /// Creates a watch client.
     #[inline]
     pub(crate) fn new(builder: ClientCallerBuilder) -> Self {
+        #[cfg(feature = "failover")]
+        let retry = builder.retry().clone();
         Self {
             inner: builder.build(Client::new),
+            #[cfg(feature = "failover")]
+            retry,
         }
     }
 
@@ -48,30 +61,111 @@ impl WatchClient {
     }
 
     /// Watches for events happening or that have happened. Both input and output
-    /// are streams; the input stream is for creating and canceling watchers and the output
+    /// are streams. The input stream creates and cancels watchers, the output
     /// stream receives responses and events.
     ///
     /// One watch stream can watch on multiple key ranges, streaming events for several watches
     /// are grouped by watch ID. The entire event history can be watched starting from the
     /// last compaction revision.
+    ///
+    /// With the `failover` feature, the returned stream transparently reconnects
+    /// on a healthy endpoint and resumes each watch from the revision after the
+    /// last one delivered.
     pub async fn watch(
         &mut self,
         key: impl Into<Vec<u8>>,
         options: Option<WatchOptions>,
     ) -> Result<WatchStream> {
-        async fn watch_impl(client: &mut Client, options: WatchOptions) -> Result<WatchStream> {
-            let (request_sender, request_receiver) = channel::<WatchRequest>(100);
-            request_sender
-                .send(options.into())
-                .await
-                .map_err(|e| Error::WatchError(e.to_string()))?;
-            let request_stream = ReceiverStream::new(request_receiver);
-            let stream = client.watch(request_stream).await?.into_inner();
-            Ok(WatchStream::new(request_sender, stream))
+        #[cfg_attr(not(feature = "failover"), allow(unused_mut))]
+        let mut create: WatchCreateRequest = options.unwrap_or_default().with_key(key).into();
+
+        #[cfg(feature = "failover")]
+        if self.retry.watch_reconnect {
+            // Assign a stable client-side watch id (honoring a caller-set id) so
+            // the caller's observed id does not change across reconnects.
+            let mut next_id = 1;
+            let id = assign_watch_id(&mut create, &mut next_id, &HashMap::new());
+            let from_now = create.start_revision == 0;
+            // Eagerly open so a connect error surfaces from `watch()`, retrying
+            // across endpoints: the single-shot open can land on a down node.
+            let (sender, stream) = self.open_retrying(vec![create.clone().into()]).await?;
+            let (user_tx, driver_rx) = channel::<WatchRequest>(100);
+            let (out_tx, out_rx) = channel::<Result<WatchResponse>>(100);
+            let driver = WatchDriver {
+                client: self.clone(),
+                retry: self.retry.clone(),
+                watches: HashMap::from([(
+                    id,
+                    WatchState {
+                        create_req: create,
+                        from_now,
+                    },
+                )]),
+                seen_created: HashSet::new(),
+                next_id,
+                reconnect_attempt: 0,
+                req_rx: driver_rx,
+                out_tx,
+            };
+            tokio::spawn(driver.run(sender, stream));
+            return Ok(WatchStream::from_driver(user_tx, out_rx));
         }
-        self.inner
-            .do_call(options.unwrap_or_default().with_key(key), watch_impl)
-            .await
+
+        let (sender, stream) = self.watch_raw(vec![create.into()]).await?;
+        Ok(WatchStream::new(sender, stream))
+    }
+
+    /// Open a fresh gRPC watch stream with `initial` requests queued before the
+    /// stream is established (etcd only emits the first response after a create
+    /// request is buffered).
+    async fn watch_raw(
+        &mut self,
+        initial: Vec<WatchRequest>,
+    ) -> Result<(Sender<WatchRequest>, Streaming<PbWatchResponse>)> {
+        async fn watch_impl(
+            client: &mut Client,
+            initial: Vec<WatchRequest>,
+        ) -> Result<(Sender<WatchRequest>, Streaming<PbWatchResponse>)> {
+            let (tx, rx) = channel::<WatchRequest>(100);
+            for req in initial {
+                tx.send(req)
+                    .await
+                    .map_err(|e| Error::WatchError(e.to_string()))?;
+            }
+            let stream = client.watch(ReceiverStream::new(rx)).await?.into_inner();
+            Ok((tx, stream))
+        }
+        self.inner.do_call(initial, watch_impl).await
+    }
+
+    /// Open the initial watch stream, failing over to a healthy endpoint on a
+    /// transient error. The balancer can route the single-shot open to a down
+    /// node, so retry it like a repeatable unary RPC (quorum-paced backoff,
+    /// bounded by the retry budget so a total outage still errors).
+    #[cfg(feature = "failover")]
+    async fn open_retrying(
+        &mut self,
+        initial: Vec<WatchRequest>,
+    ) -> Result<(Sender<WatchRequest>, Streaming<PbWatchResponse>)> {
+        use crate::failover::{classify, Decision, RetryPolicy};
+        let max = self.retry.max_attempts.max(1);
+        let mut last = None;
+        for attempt in 0..max {
+            let wait = self.retry.backoff(attempt);
+            if !wait.is_zero() {
+                tokio::time::sleep(wait).await;
+            }
+            match self.watch_raw(initial.clone()).await {
+                Ok(pair) => return Ok(pair),
+                Err(e) => match classify(&e, RetryPolicy::Repeatable) {
+                    Decision::Retry => last = Some(e),
+                    // The sub-client cannot refresh a token, so an auth error
+                    // here is terminal rather than worth burning the budget on.
+                    Decision::Stop | Decision::RefreshToken => return Err(e),
+                },
+            }
+        }
+        Err(last.expect("retry budget runs at least once"))
     }
 }
 
@@ -372,8 +466,20 @@ pub struct WatchRequestSender(Sender<WatchRequest>);
 /// The [`WatchResponseStream`] can be obtained by splitting the [`WatchStream`] using the
 /// [`WatchStream::split`] method.
 #[cfg_attr(feature = "pub-response-field", visible::StructFields(pub))]
+#[cfg_attr(feature = "pub-response-field", allow(private_interfaces))]
 #[derive(Debug)]
-pub struct WatchResponseStream(Streaming<PbWatchResponse>);
+pub struct WatchResponseStream(WatchResponseInner);
+
+/// The response side of a watch: a raw gRPC stream, or (with the `failover`
+/// feature) the output of the reconnect driver. Without `failover` this is
+/// always `Direct`, behaving exactly as the raw `tonic::Streaming` it wraps.
+#[cfg_attr(feature = "failover", allow(clippy::large_enum_variant))]
+#[derive(Debug)]
+enum WatchResponseInner {
+    Direct(Streaming<PbWatchResponse>),
+    #[cfg(feature = "failover")]
+    Resilient(Receiver<Result<WatchResponse>>),
+}
 
 impl WatchResponseStream {
     /// Receive [`WatchResponse`] from this watch response stream.
@@ -381,11 +487,18 @@ impl WatchResponseStream {
     /// See also [`WatchStream::message`] for receiving watch response from the [`WatchStream`].
     #[inline]
     pub async fn message(&mut self) -> Result<Option<WatchResponse>> {
-        self.0
-            .message()
-            .await
-            .map(|resp| resp.map(WatchResponse::new))
-            .map_err(From::from)
+        match &mut self.0 {
+            WatchResponseInner::Direct(stream) => stream
+                .message()
+                .await
+                .map(|resp| resp.map(WatchResponse::new))
+                .map_err(From::from),
+            #[cfg(feature = "failover")]
+            WatchResponseInner::Resilient(rx) => match rx.recv().await {
+                Some(resp) => resp.map(Some),
+                None => Ok(None),
+            },
+        }
     }
 }
 
@@ -398,7 +511,21 @@ impl WatchStream {
     ) -> Self {
         Self {
             request_sender: WatchRequestSender(request_sender),
-            response_stream: WatchResponseStream(response_stream),
+            response_stream: WatchResponseStream(WatchResponseInner::Direct(response_stream)),
+        }
+    }
+
+    /// Creates a `WatchStream` backed by the resilient reconnect driver: the
+    /// request sender feeds the driver, and the response stream reads the
+    /// driver's forwarded output.
+    #[cfg(feature = "failover")]
+    fn from_driver(
+        request_sender: Sender<WatchRequest>,
+        output: Receiver<Result<WatchResponse>>,
+    ) -> Self {
+        Self {
+            request_sender: WatchRequestSender(request_sender),
+            response_stream: WatchResponseStream(WatchResponseInner::Resilient(output)),
         }
     }
 
@@ -487,13 +614,15 @@ impl Stream for WatchResponseStream {
 
     #[inline]
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Pin::new(&mut self.get_mut().0)
-            .poll_next(cx)
-            .map(|t| match t {
+        match &mut self.get_mut().0 {
+            WatchResponseInner::Direct(stream) => Pin::new(stream).poll_next(cx).map(|t| match t {
                 Some(Ok(resp)) => Some(Ok(WatchResponse::new(resp))),
                 Some(Err(e)) => Some(Err(From::from(e))),
                 None => None,
-            })
+            }),
+            #[cfg(feature = "failover")]
+            WatchResponseInner::Resilient(rx) => rx.poll_recv(cx),
+        }
     }
 }
 
@@ -503,5 +632,451 @@ impl Stream for WatchStream {
     #[inline]
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         Pin::new(&mut self.get_mut().response_stream).poll_next(cx)
+    }
+}
+
+/// Broadcast progress notifications (a `request_progress` with no id) carry this
+/// sentinel id and apply to every watch on the stream. Matches etcd's
+/// `InvalidWatchID`.
+#[cfg(feature = "failover")]
+const INVALID_WATCH_ID: i64 = -1;
+
+/// Assign a stable client-side watch id: honor a caller-provided non-zero id,
+/// otherwise draw the next free id from `next_id`.
+#[cfg(feature = "failover")]
+fn assign_watch_id(
+    create: &mut WatchCreateRequest,
+    next_id: &mut i64,
+    watches: &HashMap<i64, WatchState>,
+) -> i64 {
+    if create.watch_id == 0 {
+        // Skip ids already in use so an auto-assigned id never overwrites a
+        // caller-assigned one: the registry is keyed by id, so a clash would
+        // silently drop a watch.
+        while watches.contains_key(next_id) {
+            *next_id += 1;
+        }
+        create.watch_id = *next_id;
+        *next_id += 1;
+    } else if *next_id <= create.watch_id {
+        // Keep the auto counter ahead of caller-chosen ids to avoid a later clash.
+        *next_id = create.watch_id + 1;
+    }
+    create.watch_id
+}
+
+impl From<WatchCreateRequest> for WatchRequest {
+    #[inline]
+    fn from(create: WatchCreateRequest) -> Self {
+        Self {
+            request_union: Some(WatchRequestUnion::CreateRequest(create)),
+        }
+    }
+}
+
+/// Per-watch state the resilient driver keeps so it can replay a watch after a
+/// reconnect. `create_req.start_revision` holds the resume point.
+#[cfg(feature = "failover")]
+struct WatchState {
+    create_req: WatchCreateRequest,
+    /// The watch was requested from "now" (start_revision 0), so it has no
+    /// history to replay and its resume point is pinned once created.
+    from_now: bool,
+}
+
+/// Background task that keeps a watch alive across connection failures: it owns
+/// the gRPC stream, forwards responses to the caller, tracks each watch's resume
+/// revision, and re-establishes the stream on a healthy endpoint when it breaks.
+#[cfg(feature = "failover")]
+struct WatchDriver {
+    client: WatchClient,
+    retry: RetryConfig,
+    watches: HashMap<i64, WatchState>,
+    /// Watch ids whose `created` ack was already delivered, so the duplicate
+    /// echoed after a reconnect replay is suppressed.
+    seen_created: HashSet<i64>,
+    next_id: i64,
+    /// Consecutive reconnect attempts without an intervening response, used to
+    /// grow the reconnect backoff. Reset to 0 once the stream delivers again.
+    reconnect_attempt: u32,
+    req_rx: Receiver<WatchRequest>,
+    out_tx: Sender<Result<WatchResponse>>,
+}
+
+#[cfg(feature = "failover")]
+impl WatchDriver {
+    async fn run(
+        mut self,
+        mut sender: Sender<WatchRequest>,
+        mut stream: Streaming<PbWatchResponse>,
+    ) {
+        let mut req_open = true;
+        loop {
+            tokio::select! {
+                // Caller dropped the response stream: nothing left to serve.
+                _ = self.out_tx.closed() => return,
+                r = self.req_rx.recv(), if req_open => match r {
+                    Some(req) => {
+                        let outbound = self.apply_user_request(req);
+                        if sender.send(outbound).await.is_err() {
+                            match self.reconnect().await {
+                                Some((s, st)) => { sender = s; stream = st; }
+                                None => return,
+                            }
+                        }
+                    }
+                    // Caller dropped the request side: stop accepting requests
+                    // but keep delivering responses.
+                    None => req_open = false,
+                },
+                msg = stream.message() => match msg {
+                    Ok(Some(resp)) => {
+                        // A delivered response proves the stream is healthy.
+                        self.reconnect_attempt = 0;
+                        if self.forward(WatchResponse::new(resp)).await.is_err() {
+                            return;
+                        }
+                    }
+                    Ok(None) | Err(_) => match self.reconnect().await {
+                        Some((s, st)) => { sender = s; stream = st; }
+                        None => return,
+                    },
+                },
+            }
+        }
+    }
+
+    /// Record a user request in the registry and return the request to forward,
+    /// assigning a stable client-side id to creates.
+    fn apply_user_request(&mut self, req: WatchRequest) -> WatchRequest {
+        match req.request_union {
+            Some(WatchRequestUnion::CreateRequest(mut create)) => {
+                let id = assign_watch_id(&mut create, &mut self.next_id, &self.watches);
+                let from_now = create.start_revision == 0;
+                self.watches.insert(
+                    id,
+                    WatchState {
+                        create_req: create.clone(),
+                        from_now,
+                    },
+                );
+                create.into()
+            }
+            Some(WatchRequestUnion::CancelRequest(cancel)) => {
+                // Drop from the registry so a reconnect does not recreate it.
+                self.watches.remove(&cancel.watch_id);
+                self.seen_created.remove(&cancel.watch_id);
+                cancel.into()
+            }
+            other => WatchRequest {
+                request_union: other,
+            },
+        }
+    }
+
+    /// Forward a response, updating the watch's resume revision. Returns `Err`
+    /// when the caller has dropped the response stream.
+    async fn forward(&mut self, resp: WatchResponse) -> std::result::Result<(), ()> {
+        if !Self::record(&mut self.watches, &mut self.seen_created, &resp) {
+            return Ok(());
+        }
+        self.out_tx.send(Ok(resp)).await.map_err(|_| ())
+    }
+
+    /// Update the registry for `resp` and report whether it should reach the
+    /// caller. Returns `false` to suppress a duplicate `created` ack echoed
+    /// after a reconnect replay. Pure over the two maps so it is unit-testable.
+    fn record(
+        watches: &mut HashMap<i64, WatchState>,
+        seen_created: &mut HashSet<i64>,
+        resp: &WatchResponse,
+    ) -> bool {
+        let id = resp.watch_id();
+        let header_rev = resp.header().map(|h| h.revision()).unwrap_or(0);
+
+        if resp.created() {
+            // A create the server rejects (denied or invalid range) comes back
+            // as created and canceled together. Drop it so a reconnect does not
+            // replay a doomed create forever, and still forward it so the caller
+            // sees the cancel reason.
+            if resp.canceled() || resp.compact_revision() != 0 {
+                watches.remove(&id);
+                seen_created.remove(&id);
+            } else if seen_created.insert(id) {
+                if let Some(ws) = watches.get_mut(&id) {
+                    // etcd binds a from-now watch at header+1, so resuming there
+                    // reproduces the server's effective start without replaying
+                    // the pre-watch event at `header`.
+                    if ws.from_now {
+                        ws.create_req.start_revision = header_rev + 1;
+                    }
+                }
+            } else {
+                // Duplicate created ack echoed after a reconnect replay.
+                return false;
+            }
+        } else if resp.canceled() || resp.compact_revision() != 0 {
+            watches.remove(&id);
+            seen_created.remove(&id);
+        } else if id == INVALID_WATCH_ID {
+            // Broadcast progress notification: it applies to every watch, so
+            // advance them all so an idle reconnect resumes near the head
+            // instead of replaying history from each watch's last event.
+            for ws in watches.values_mut() {
+                if header_rev + 1 > ws.create_req.start_revision {
+                    ws.create_req.start_revision = header_rev + 1;
+                }
+            }
+        } else if let Some(ws) = watches.get_mut(&id) {
+            // Hold the resume point on a non-final fragment: the rest of the
+            // revision arrives in later fragments and resuming past it would
+            // skip them.
+            if !resp.0.fragment {
+                // Events carry the highest revision in this batch. A per-watch
+                // progress notification (no events) advances to the header.
+                let last_event_rev = resp
+                    .events()
+                    .last()
+                    .and_then(|e| e.kv().map(|kv| kv.mod_revision()));
+                let new_start = last_event_rev.map_or(header_rev + 1, |r| r + 1);
+                if new_start > ws.create_req.start_revision {
+                    ws.create_req.start_revision = new_start;
+                }
+            }
+        }
+        true
+    }
+
+    /// Re-establish the stream and replay active watches from their resume
+    /// revision. Returns `None` to stop the driver: the caller gave up, or no
+    /// active watches remain to resubscribe.
+    async fn reconnect(&mut self) -> Option<(Sender<WatchRequest>, Streaming<PbWatchResponse>)> {
+        use crate::failover::{classify, Decision, RetryPolicy};
+        loop {
+            if self.out_tx.is_closed() || self.watches.is_empty() {
+                return None;
+            }
+            if self.reconnect_attempt == 0 {
+                tracing::warn!(
+                    target: "etcd_client::failover",
+                    watches = self.watches.len(),
+                    "etcd watch stream broke, reconnecting and resuming from last revision",
+                );
+            }
+            // Always wait before (re)opening: a stream that establishes then
+            // immediately breaks would otherwise hot-loop with no floor. The
+            // delay grows until a response arrives (which resets the counter),
+            // mirroring etcd's per-cycle retryConnWait.
+            let wait = self.retry.reconnect_backoff(self.reconnect_attempt);
+            self.reconnect_attempt = self.reconnect_attempt.saturating_add(1);
+            tokio::time::sleep(wait).await;
+            let initial: Vec<WatchRequest> = self
+                .watches
+                .values()
+                .map(|ws| ws.create_req.clone().into())
+                .collect();
+            match self.client.watch_raw(initial).await {
+                Ok(pair) => return Some(pair),
+                // A permanent error (e.g. an expired auth token the driver
+                // cannot refresh) would otherwise retry forever as a silent
+                // hang. Surface it and stop so the caller can rebuild through
+                // Client.
+                Err(e) if !matches!(classify(&e, RetryPolicy::Repeatable), Decision::Retry) => {
+                    tracing::warn!(
+                        target: "etcd_client::failover",
+                        error = %e,
+                        "etcd watch stream reconnect hit a permanent error, giving up",
+                    );
+                    let _ = self.out_tx.send(Err(e)).await;
+                    return None;
+                }
+                Err(_) => {}
+            }
+        }
+    }
+}
+
+#[cfg(all(test, feature = "failover"))]
+mod driver_tests {
+    use super::*;
+    use crate::rpc::pb::etcdserverpb::ResponseHeader as PbHeader;
+    use crate::rpc::pb::mvccpb::KeyValue as PbKeyValue;
+
+    fn ws(from_now: bool, start_revision: i64) -> WatchState {
+        WatchState {
+            create_req: WatchCreateRequest {
+                start_revision,
+                ..Default::default()
+            },
+            from_now,
+        }
+    }
+
+    fn header(rev: i64) -> Option<PbHeader> {
+        Some(PbHeader {
+            revision: rev,
+            ..Default::default()
+        })
+    }
+
+    fn event(mod_revision: i64) -> PbEvent {
+        PbEvent {
+            kv: Some(PbKeyValue {
+                mod_revision,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn record(
+        watches: &mut HashMap<i64, WatchState>,
+        seen: &mut HashSet<i64>,
+        pb: PbWatchResponse,
+    ) -> bool {
+        WatchDriver::record(watches, seen, &WatchResponse(pb))
+    }
+
+    #[test]
+    fn created_ack_forwarded_once_then_deduped() {
+        let mut watches = HashMap::from([(1, ws(false, 7))]);
+        let mut seen = HashSet::new();
+        assert!(record(
+            &mut watches,
+            &mut seen,
+            PbWatchResponse {
+                watch_id: 1,
+                created: true,
+                header: header(10),
+                ..Default::default()
+            }
+        ));
+        assert!(seen.contains(&1));
+        // A replayed created ack after a reconnect is suppressed.
+        assert!(!record(
+            &mut watches,
+            &mut seen,
+            PbWatchResponse {
+                watch_id: 1,
+                created: true,
+                header: header(10),
+                ..Default::default()
+            }
+        ));
+    }
+
+    #[test]
+    fn from_now_created_pins_resume_to_header_plus_one() {
+        let mut watches = HashMap::from([(1, ws(true, 0))]);
+        let mut seen = HashSet::new();
+        record(
+            &mut watches,
+            &mut seen,
+            PbWatchResponse {
+                watch_id: 1,
+                created: true,
+                header: header(42),
+                ..Default::default()
+            },
+        );
+        assert_eq!(watches[&1].create_req.start_revision, 43);
+    }
+
+    #[test]
+    fn rejected_create_is_removed_and_forwarded() {
+        // A doomed create comes back as created and canceled together.
+        let mut watches = HashMap::from([(1, ws(false, 0))]);
+        let mut seen = HashSet::new();
+        let forwarded = record(
+            &mut watches,
+            &mut seen,
+            PbWatchResponse {
+                watch_id: 1,
+                created: true,
+                canceled: true,
+                cancel_reason: "denied".into(),
+                header: header(5),
+                ..Default::default()
+            },
+        );
+        assert!(forwarded, "caller must see the rejection");
+        assert!(
+            watches.is_empty(),
+            "doomed create must not be replayed on reconnect"
+        );
+        assert!(!seen.contains(&1));
+    }
+
+    #[test]
+    fn events_advance_resume_past_last_mod_revision() {
+        let mut watches = HashMap::from([(1, ws(false, 0))]);
+        let mut seen = HashSet::from([1]);
+        record(
+            &mut watches,
+            &mut seen,
+            PbWatchResponse {
+                watch_id: 1,
+                header: header(20),
+                events: vec![event(18), event(20)],
+                ..Default::default()
+            },
+        );
+        assert_eq!(watches[&1].create_req.start_revision, 21);
+    }
+
+    #[test]
+    fn non_final_fragment_holds_resume() {
+        let mut watches = HashMap::from([(1, ws(false, 0))]);
+        let mut seen = HashSet::from([1]);
+        record(
+            &mut watches,
+            &mut seen,
+            PbWatchResponse {
+                watch_id: 1,
+                header: header(20),
+                fragment: true,
+                events: vec![event(20)],
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            watches[&1].create_req.start_revision, 0,
+            "resume must not advance on a non-final fragment"
+        );
+    }
+
+    #[test]
+    fn canceled_removes_watch() {
+        let mut watches = HashMap::from([(1, ws(false, 5))]);
+        let mut seen = HashSet::from([1]);
+        record(
+            &mut watches,
+            &mut seen,
+            PbWatchResponse {
+                watch_id: 1,
+                canceled: true,
+                header: header(9),
+                ..Default::default()
+            },
+        );
+        assert!(watches.is_empty());
+        assert!(!seen.contains(&1));
+    }
+
+    #[test]
+    fn broadcast_progress_advances_all_watches() {
+        let mut watches = HashMap::from([(1, ws(false, 2)), (2, ws(false, 3))]);
+        let mut seen = HashSet::from([1, 2]);
+        record(
+            &mut watches,
+            &mut seen,
+            PbWatchResponse {
+                watch_id: INVALID_WATCH_ID,
+                header: header(50),
+                ..Default::default()
+            },
+        );
+        assert_eq!(watches[&1].create_req.start_revision, 51);
+        assert_eq!(watches[&2].create_req.start_revision, 51);
     }
 }

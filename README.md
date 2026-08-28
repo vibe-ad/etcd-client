@@ -80,6 +80,37 @@ created successfully or not, or if it is a cancel response.
 
 See [watch.rs](./examples/watch.rs) for example.
 
+## Failover
+
+With the `failover` feature enabled, a `Client` connected to multiple endpoints
+tolerates partial cluster failures. It is opt-in and off by default, so the
+default build is unchanged:
+
+```toml
+etcd-client = { version = "0.19", features = ["failover"] }
+```
+
+- **Request retry / failover.** Idempotent RPCs (reads, most lease operations)
+  retry on transient `Unavailable` errors and fail over to a healthy endpoint.
+  Mutating RPCs (`put`, `delete`, `txn`, member changes, ...) are retried **only**
+  when the request provably never reached a server, preserving
+  *write-at-most-once*: a failed write is never silently applied twice.
+- **Streaming reconnection.** A broken watch stream re-establishes on a healthy
+  endpoint and resumes each watch from the revision after the last one delivered.
+  A broken lease keep-alive stream re-establishes and resumes renewals.
+- **Auth token refresh.** An expired auth token is refreshed and the call
+  retried, mirroring Go `clientv3`. This is unconditional under `failover`,
+  so `ConnectOptions::with_auto_token_refresh` is ignored: enabling it would
+  only nest a second retry loop and clone every request twice.
+
+Tune via `ConnectOptions`: `with_retries`, `with_retry_backoff`,
+`with_watch_reconnect` and `with_lease_keepalive_reconnect`. The design mirrors
+etcd's official Go `clientv3` retry semantics.
+
+Watch reconnection assigns a client-side `watch_id` to keep the caller's id
+stable across reconnects, which requires **etcd 3.4 or newer**. Older servers
+ignore the field and auto-assign ids, which would desync the resume tracking.
+
 ## Examples
 
 Examples can be found in [`examples`](./examples).
@@ -106,6 +137,7 @@ Examples can be found in [`examples`](./examples).
 - `build-server`: Builds a server variant of the etcd protobuf and re-exports it under the same
   `proto` package as the `pub-response-field` feature does.
 - `raw-channel`: Allows the caller to construct the underlying Tonic channel used by the client.
+- `failover`: Opt-in request-level failover. See [Failover](#failover). Not enabled by default.
 
 ## Test
 

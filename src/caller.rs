@@ -30,6 +30,8 @@ pub struct ClientCallerBuilder {
     auth_token: AuthToken,
     auth_client: AuthClient,
     channel: InterceptedChannel,
+    #[cfg(feature = "failover")]
+    retry: crate::failover::RetryConfig,
 }
 
 impl ClientCallerBuilder {
@@ -45,17 +47,36 @@ impl ClientCallerBuilder {
             auth_token,
             auth_client,
             channel,
+            #[cfg(feature = "failover")]
+            retry: crate::failover::RetryConfig::disabled(),
         }
+    }
+
+    /// Installs the failover config every built [`ClientCaller`] inherits.
+    #[cfg(feature = "failover")]
+    pub(crate) fn with_retry(mut self, retry: crate::failover::RetryConfig) -> Self {
+        self.retry = retry;
+        self
+    }
+
+    /// The failover config, for sub-clients that drive their own retry loop.
+    #[cfg(feature = "failover")]
+    pub(crate) fn retry(&self) -> &crate::failover::RetryConfig {
+        &self.retry
     }
 
     /// Build a new [`ClientCaller`] passing an actual client implementation.
     pub fn build<T>(self, f_inner: impl FnOnce(InterceptedChannel) -> T) -> ClientCaller<T> {
-        ClientCaller::new(
+        #[allow(unused_mut)]
+        let mut caller = ClientCaller::new(
             f_inner(self.channel),
             self.auth_client,
             self.auth_token,
             self.options,
-        )
+        );
+        #[cfg(feature = "failover")]
+        caller.set_retry(self.retry);
+        caller
     }
 }
 
@@ -72,6 +93,8 @@ pub struct ClientCaller<T> {
     auth_client: AuthClient,
     auth_token: AuthToken,
     options: CallOptions,
+    #[cfg(feature = "failover")]
+    retry: crate::failover::RetryConfig,
 }
 
 impl<T> ClientCaller<T> {
@@ -87,7 +110,25 @@ impl<T> ClientCaller<T> {
             auth_client,
             auth_token,
             options,
+            // Overwritten by `ClientCallerBuilder::build`, which is how every
+            // caller inside the crate is constructed.
+            #[cfg(feature = "failover")]
+            retry: crate::failover::RetryConfig::disabled(),
         }
+    }
+
+    #[cfg(feature = "failover")]
+    fn set_retry(&mut self, retry: crate::failover::RetryConfig) {
+        self.retry = retry;
+    }
+
+    /// Whether credentials are currently installed. Tracks `update_user`, unlike
+    /// the [`ConnectOptions`] copy the client was built from.
+    ///
+    /// [`ConnectOptions`]: `crate::ConnectOptions`
+    #[cfg(feature = "failover")]
+    pub(crate) fn has_creds(&self) -> bool {
+        self.options.creds.read_unpoisoned().is_some()
     }
 
     /// Refresh the authentication token if the client has credentials options.
@@ -163,11 +204,59 @@ impl<T> ClientCaller<T> {
         user: String,
         password: String,
     ) -> Result<MetadataValue<Ascii>> {
+        #[cfg(not(feature = "failover"))]
         let resp = self
             .auth_client
             .clone()
             .authenticate(user, password)
             .await?;
+
+        // Authenticate is idempotent (it only mints a token), so fail it over to
+        // a healthy endpoint on a transient error. This keeps an authenticated
+        // connect and in-flight reauth working when the balancer routes the
+        // authenticate RPC to a down node, the scenario failover targets.
+        #[cfg(feature = "failover")]
+        let resp = {
+            use crate::failover::{classify, Decision, RetryPolicy};
+            let max = self.retry.max_attempts.max(1);
+            let mut last = None;
+            let mut ok = None;
+            for attempt in 0..max {
+                let wait = self.retry.backoff(attempt);
+                if !wait.is_zero() {
+                    tokio::time::sleep(wait).await;
+                }
+                match self
+                    .auth_client
+                    .clone()
+                    .authenticate(user.clone(), password.clone())
+                    .await
+                {
+                    Ok(resp) => {
+                        ok = Some(resp);
+                        break;
+                    }
+                    Err(e) => match classify(&e, RetryPolicy::Repeatable) {
+                        Decision::Retry => {
+                            tracing::warn!(
+                                target: "etcd_client::failover",
+                                attempt = attempt + 1,
+                                max,
+                                error = %e,
+                                "etcd authenticate RPC failed, failing over to another endpoint",
+                            );
+                            last = Some(e);
+                        }
+                        _ => return Err(e),
+                    },
+                }
+            }
+            match ok {
+                Some(resp) => resp,
+                None => return Err(last.expect("retry budget runs at least once")),
+            }
+        };
+
         let token = resp.token().parse()?;
         Ok(token)
     }

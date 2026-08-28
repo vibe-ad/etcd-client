@@ -25,6 +25,7 @@ tls-webpki-roots = ["tonic/tls-webpki-roots"]
 pub-response-field = ["visible"]
 build-server = ["pub-response-field"]
 raw-channel = []
+failover = ["dep:h2", "dep:tracing", "tokio/time", "tokio/rt"]
 
 [dependencies]
 tonic = "0.14"
@@ -36,6 +37,14 @@ tower-service = "0.3"
 http = "1.1"
 visible = { version = "0.0.1", optional = true }
 tower = { version = "0.5", default-features = false }
+# Must stay on the same major as tonic's h2, otherwise the REFUSED_STREAM
+# downcast in the failover module silently never matches and write failover
+# degrades. Keep in sync with tonic and verify `cargo tree` shows a single h2.
+h2 = { version = "0.4", optional = true }
+# `log` feature bridges tracing events to `log` records when no tracing
+# Subscriber is installed, so failover warns surface in plain `log`/env_logger
+# backends (as used by the DSP services) without pulling in tracing-subscriber.
+tracing = { version = "0.1", features = ["log"], optional = true }
 openssl = { version = "0.10", optional = true }
 hyper = { version = "1.4", features = ["client"], optional = true }
 hyper-openssl = { version = "0.10", features = ["client-legacy", "tokio"], optional = true }
