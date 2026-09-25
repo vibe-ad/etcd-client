@@ -29,9 +29,9 @@ jobs:
       - run: sudo docker exec etcd-server etcdctl user grant-role root root
       - run: sudo apt install -y protobuf-compiler libprotobuf-dev curl
       - name: Check out repository code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: install cargo-hack
-        uses: taiki-e/install-action@cargo-hack
+        uses: taiki-e/install-action@cbf25e4064c07d51a4f200ed7e30835c8c369e00 # cargo-hack
       - run: cargo --version --verbose
       - run: rustc --version --verbose
       - name: format check
