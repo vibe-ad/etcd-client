@@ -92,6 +92,8 @@ etcd-client = { version = "0.19", features = ["failover"] }
 
 - **Request retry / failover.** Idempotent RPCs (reads, most lease operations)
   retry on transient `Unavailable` errors and fail over to a healthy endpoint.
+  tonic reports a connection severed under an in-flight call as `Unknown`, where
+  grpc-go reports `Unavailable`, so that case is treated as `Unavailable` too.
   Mutating RPCs (`put`, `delete`, `txn`, member changes, ...) are retried **only**
   when the request provably never reached a server, preserving
   *write-at-most-once*: a failed write is never silently applied twice.

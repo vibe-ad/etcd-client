@@ -8,10 +8,13 @@ mod testing;
 
 use crate::testing::{get_client, Result, DEFAULT_TEST_ENDPOINT};
 use etcd_client::{
-    Client, Compare, CompareOp, ConnectOptions, DeleteOptions, EventType, LeaseKeepAliveStream,
-    LeaseKeeper, Txn, TxnOp, WatchStream,
+    Client, Compare, CompareOp, ConnectOptions, DeleteOptions, Error, EventType, GetOptions,
+    LeaseKeepAliveStream, LeaseKeeper, Txn, TxnOp, WatchStream,
 };
 use std::time::Duration;
+use tokio::io::copy_bidirectional;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::task::{JoinHandle, JoinSet};
 
 /// A closed port on localhost: connecting to it fails fast with a refused
 /// connection, the cleanest stand-in for a down node.
@@ -34,6 +37,26 @@ fn three_node_cluster() -> [String; 3] {
         "localhost:2381".to_string(),
         "localhost:2383".to_string(),
     ]
+}
+
+/// A TCP proxy to the healthy node. Aborting the returned handle closes the
+/// listener and drops every proxied connection, so the endpoint dies under
+/// established connections the way a restarted member does, unlike a port that
+/// never listened.
+async fn spawn_proxy() -> (String, JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind proxy");
+    let addr = listener.local_addr().expect("proxy addr").to_string();
+    let handle = tokio::spawn(async move {
+        let mut conns = JoinSet::new();
+        while let Ok((mut inbound, _)) = listener.accept().await {
+            conns.spawn(async move {
+                if let Ok(mut outbound) = TcpStream::connect(DEFAULT_TEST_ENDPOINT).await {
+                    copy_bidirectional(&mut inbound, &mut outbound).await.ok();
+                }
+            });
+        }
+    });
+    (addr, handle)
 }
 
 /// Opens a watch, retrying the open until it establishes. Used only by the
@@ -86,6 +109,50 @@ async fn dead_endpoint_reads_and_writes_succeed() -> Result<()> {
 
     client
         .delete("failover/", Some(DeleteOptions::new().with_prefix()))
+        .await?;
+    Ok(())
+}
+
+/// Reads keep succeeding when an endpoint dies mid-session. Calls in flight at
+/// the kill are severed (`Unknown`, broken pipe), later ones hit the refused
+/// reconnect (`Unavailable`), and both must fail over.
+#[tokio::test(flavor = "multi_thread")]
+async fn reads_survive_an_endpoint_killed_mid_session() -> Result<()> {
+    let (proxy, proxy_task) = spawn_proxy().await;
+    // The balancer keeps offering the refused endpoint, so each attempt is a coin
+    // flip. A wide budget keeps 3200 calls from ever losing every flip.
+    let options = ConnectOptions::new()
+        .with_connect_timeout(Duration::from_secs(1))
+        .with_retries(40);
+    let mut client =
+        Client::connect([proxy, DEFAULT_TEST_ENDPOINT.to_string()], Some(options)).await?;
+
+    let prefix = "failover-killed/";
+    for i in 0..10 {
+        client.put(format!("{prefix}{i}"), "v", None).await?;
+    }
+
+    let mut readers = JoinSet::new();
+    for _ in 0..16 {
+        let mut client = client.clone();
+        readers.spawn(async move {
+            for _ in 0..200 {
+                let resp = client
+                    .get(prefix, Some(GetOptions::new().with_prefix()))
+                    .await?;
+                assert_eq!(resp.kvs().len(), 10);
+            }
+            Ok::<_, Error>(())
+        });
+    }
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    proxy_task.abort();
+    while let Some(reader) = readers.join_next().await {
+        reader.expect("reader panicked")?;
+    }
+
+    client
+        .delete(prefix, Some(DeleteOptions::new().with_prefix()))
         .await?;
     Ok(())
 }

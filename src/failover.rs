@@ -124,7 +124,13 @@ pub(crate) fn classify(err: &Error, policy: RetryPolicy) -> Decision {
     if is_auth_token_error(status) {
         return Decision::RefreshToken;
     }
-    match status.code() {
+    // tonic reports a connection severed under an in-flight call as `Unknown`,
+    // where grpc-go (and so clientv3's retry policy) sees `Unavailable`.
+    let code = match status.code() {
+        Code::Unknown if is_transport_error(status) => Code::Unavailable,
+        code => code,
+    };
+    match code {
         Code::Unavailable => match policy {
             RetryPolicy::Repeatable => Decision::Retry,
             // Only retry a mutating RPC when we can prove it never reached a
@@ -178,6 +184,19 @@ fn is_not_sent(status: &Status) -> bool {
             ) {
                 return true;
             }
+        }
+        source = err.source();
+    }
+    false
+}
+
+/// True when the status was raised client-side by a broken connection rather
+/// than returned by the server. A server `Unknown` carries no source.
+fn is_transport_error(status: &Status) -> bool {
+    let mut source = status.source();
+    while let Some(err) = source {
+        if err.is::<std::io::Error>() || err.is::<h2::Error>() {
+            return true;
         }
         source = err.source();
     }
@@ -281,6 +300,33 @@ mod tests {
         }
         assert!(matches!(
             classify(&Error::EndpointsNotManaged, RetryPolicy::Repeatable),
+            Decision::Stop
+        ));
+    }
+
+    #[test]
+    fn severed_connection_fails_over_only_when_repeatable() {
+        let severed = Error::GRpcStatus(Status::from_error(Box::new(std::io::Error::from(
+            std::io::ErrorKind::BrokenPipe,
+        ))));
+        let Error::GRpcStatus(status) = &severed else {
+            unreachable!()
+        };
+        assert_eq!(status.code(), Code::Unknown);
+        assert!(matches!(
+            classify(&severed, RetryPolicy::Repeatable),
+            Decision::Retry
+        ));
+        assert!(matches!(
+            classify(&severed, RetryPolicy::NonRepeatable),
+            Decision::Stop
+        ));
+    }
+
+    #[test]
+    fn server_unknown_stops() {
+        assert!(matches!(
+            classify(&err(Code::Unknown, "x"), RetryPolicy::Repeatable),
             Decision::Stop
         ));
     }
