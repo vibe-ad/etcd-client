@@ -8,6 +8,7 @@ use crate::intercept::{InterceptedChannel, Interceptor};
 #[cfg(feature = "tls-openssl")]
 use crate::openssl_tls::{OpenSslClientConfig, OpenSslConnector};
 use crate::rpc::auth::Permission;
+use crate::rpc::auth::RawAuthClient;
 use crate::rpc::auth::{AuthClient, AuthDisableResponse, AuthEnableResponse};
 use crate::rpc::auth::{
     RoleAddResponse, RoleDeleteResponse, RoleGetResponse, RoleGrantPermissionResponse,
@@ -55,28 +56,6 @@ const HTTP_PREFIX: &str = "http://";
 const HTTPS_PREFIX: &str = "https://";
 
 pub(crate) type AuthToken = Arc<RwLock<Option<MetadataValue<Ascii>>>>;
-
-/// Dispatch a unary sub-client call. With the `failover` feature it retries via
-/// [`Client::run_failover`], cloning the sub-client and (owned, `Clone`)
-/// arguments per attempt so the request is replayable. Without it, a plain call.
-macro_rules! failover {
-    ($self:ident, $policy:ident, $sub:ident, $m:ident $(, $a:ident)*) => {{
-        #[cfg(not(feature = "failover"))]
-        {
-            $self.$sub.$m($($a),*).await
-        }
-        #[cfg(feature = "failover")]
-        {
-            $self
-                .run_failover(crate::failover::RetryPolicy::$policy, || {
-                    let mut client = $self.$sub.clone();
-                    $(let $a = $a.clone();)*
-                    async move { client.$m($($a),*).await }
-                })
-                .await
-        }
-    }};
-}
 
 /// Asynchronous `etcd` client using v3 API.
 #[derive(Clone)]
@@ -295,14 +274,18 @@ impl Client {
         options: ConnectOptions,
         #[cfg(feature = "failover")] retry: crate::failover::RetryConfig,
     ) -> Self {
-        let auth = AuthClient::new(channel.clone());
-        let builder =
-            ClientCallerBuilder::new((&options).into(), auth_token, auth.clone(), channel);
-        // Every caller the builder produces inherits the config, so the
-        // re-authentication RPC fails over from any sub-client too.
+        let builder = ClientCallerBuilder::new(
+            (&options).into(),
+            auth_token,
+            RawAuthClient::new(channel.clone()),
+            channel,
+        );
+        // Every caller the builder produces inherits the config, so each
+        // sub-client, raw or behind `Client`, fails over the same way.
         #[cfg(feature = "failover")]
         let builder = builder.with_retry(retry.clone());
 
+        let auth = AuthClient::new(builder.clone());
         let kv = KvClient::new(builder.clone());
         let watch = WatchClient::new(builder.clone());
         let lease = LeaseClient::new(builder.clone());
@@ -350,67 +333,6 @@ impl Client {
             options.watch_reconnect.unwrap_or(retry_on),
             options.lease_keepalive_reconnect.unwrap_or(retry_on),
         )
-    }
-
-    /// Run a unary operation with retry/failover according to `policy`,
-    /// re-authenticating on token expiry. A no-op wrapper when retry is
-    /// disabled (single attempt).
-    #[cfg(feature = "failover")]
-    async fn run_failover<T, F, Fut>(
-        &self,
-        policy: crate::failover::RetryPolicy,
-        mut op: F,
-    ) -> Result<T>
-    where
-        F: FnMut() -> Fut,
-        Fut: std::future::Future<Output = Result<T>>,
-    {
-        use crate::failover::Decision;
-        let cfg = &self.retry;
-        let max = cfg.max_attempts.max(1);
-        let mut last: Option<Error> = None;
-        for attempt in 0..max {
-            let wait = cfg.backoff(attempt);
-            if !wait.is_zero() {
-                tokio::time::sleep(wait).await;
-            }
-            match op().await {
-                Ok(v) => return Ok(v),
-                Err(e) => match crate::failover::classify(&e, policy) {
-                    Decision::RefreshToken => {
-                        // Without credentials there is nothing to refresh, so
-                        // retrying the same auth error would just burn the budget.
-                        if !self.client_caller.has_creds() {
-                            return Err(e);
-                        }
-                        tracing::warn!(
-                            target: "etcd_client::failover",
-                            attempt = attempt + 1,
-                            max,
-                            error = %e,
-                            "etcd auth token rejected, refreshing and retrying",
-                        );
-                        // Reauth is best-effort: a refresh that itself fails (for
-                        // example it hit the down endpoint) must not mask the
-                        // original error, so keep it and let the budget continue.
-                        let _ = self.refresh_token().await;
-                        last = Some(e);
-                    }
-                    Decision::Retry => {
-                        tracing::warn!(
-                            target: "etcd_client::failover",
-                            attempt = attempt + 1,
-                            max,
-                            error = %e,
-                            "etcd unary RPC failed, failing over to another endpoint",
-                        );
-                        last = Some(e);
-                    }
-                    Decision::Stop => return Err(e),
-                },
-            }
-        }
-        Err(last.expect("retry loop runs at least once"))
     }
 
     /// Dynamically add an endpoint to the client.
@@ -514,8 +436,7 @@ impl Client {
         value: impl Into<Vec<u8>>,
         options: Option<PutOptions>,
     ) -> Result<PutResponse> {
-        let (key, value) = (key.into(), value.into());
-        failover!(self, NonRepeatable, kv, put, key, value, options)
+        self.kv.put(key, value, options).await
     }
 
     /// Gets the key from the key-value store.
@@ -525,8 +446,7 @@ impl Client {
         key: impl Into<Vec<u8>>,
         options: Option<GetOptions>,
     ) -> Result<GetResponse> {
-        let key = key.into();
-        failover!(self, Repeatable, kv, get, key, options)
+        self.kv.get(key, options).await
     }
 
     /// Deletes the given key from the key-value store.
@@ -536,8 +456,7 @@ impl Client {
         key: impl Into<Vec<u8>>,
         options: Option<DeleteOptions>,
     ) -> Result<DeleteResponse> {
-        let key = key.into();
-        failover!(self, NonRepeatable, kv, delete, key, options)
+        self.kv.delete(key, options).await
     }
 
     /// Compacts the event history in the etcd key-value store. The key-value
@@ -549,7 +468,7 @@ impl Client {
         revision: i64,
         options: Option<CompactionOptions>,
     ) -> Result<CompactionResponse> {
-        failover!(self, NonRepeatable, kv, compact, revision, options)
+        self.kv.compact(revision, options).await
     }
 
     /// Processes multiple operations in a single transaction.
@@ -558,7 +477,7 @@ impl Client {
     /// It is not allowed to modify the same key several times within one txn.
     #[inline]
     pub async fn txn(&mut self, txn: Txn) -> Result<TxnResponse> {
-        failover!(self, NonRepeatable, kv, txn, txn)
+        self.kv.txn(txn).await
     }
 
     /// Watches for events happening or that have happened. Both input and output
@@ -583,13 +502,13 @@ impl Client {
         ttl: i64,
         options: Option<LeaseGrantOptions>,
     ) -> Result<LeaseGrantResponse> {
-        failover!(self, Repeatable, lease, grant, ttl, options)
+        self.lease.grant(ttl, options).await
     }
 
     /// Revokes a lease. All keys attached to the lease will expire and be deleted.
     #[inline]
     pub async fn lease_revoke(&mut self, id: i64) -> Result<LeaseRevokeResponse> {
-        failover!(self, Repeatable, lease, revoke, id)
+        self.lease.revoke(id).await
     }
 
     /// Keeps the lease alive by streaming keep alive requests from the client
@@ -609,13 +528,13 @@ impl Client {
         id: i64,
         options: Option<LeaseTimeToLiveOptions>,
     ) -> Result<LeaseTimeToLiveResponse> {
-        failover!(self, Repeatable, lease, time_to_live, id, options)
+        self.lease.time_to_live(id, options).await
     }
 
     /// Lists all existing leases.
     #[inline]
     pub async fn leases(&mut self) -> Result<LeaseLeasesResponse> {
-        failover!(self, Repeatable, lease, leases)
+        self.lease.leases().await
     }
 
     /// Lock acquires a distributed shared lock on a given named lock.
@@ -630,8 +549,7 @@ impl Client {
         name: impl Into<Vec<u8>>,
         options: Option<LockOptions>,
     ) -> Result<LockResponse> {
-        let name = name.into();
-        failover!(self, NonRepeatable, lock, lock, name, options)
+        self.lock.lock(name, options).await
     }
 
     /// Unlock takes a key returned by Lock and releases the hold on lock. The
@@ -639,47 +557,43 @@ impl Client {
     /// ownership of the lock.
     #[inline]
     pub async fn unlock(&mut self, key: impl Into<Vec<u8>>) -> Result<UnlockResponse> {
-        let key = key.into();
-        failover!(self, Repeatable, lock, unlock, key)
+        self.lock.unlock(key).await
     }
 
     /// Enables authentication.
     #[inline]
     pub async fn auth_enable(&mut self) -> Result<AuthEnableResponse> {
-        failover!(self, NonRepeatable, auth, auth_enable)
+        self.auth.auth_enable().await
     }
 
     /// Disables authentication.
     #[inline]
     pub async fn auth_disable(&mut self) -> Result<AuthDisableResponse> {
-        failover!(self, NonRepeatable, auth, auth_disable)
+        self.auth.auth_disable().await
     }
 
     /// Adds role.
     #[inline]
     pub async fn role_add(&mut self, name: impl Into<String>) -> Result<RoleAddResponse> {
-        let name = name.into();
-        failover!(self, NonRepeatable, auth, role_add, name)
+        self.auth.role_add(name).await
     }
 
     /// Deletes role.
     #[inline]
     pub async fn role_delete(&mut self, name: impl Into<String>) -> Result<RoleDeleteResponse> {
-        let name = name.into();
-        failover!(self, NonRepeatable, auth, role_delete, name)
+        self.auth.role_delete(name).await
     }
 
     /// Gets role.
     #[inline]
     pub async fn role_get(&mut self, name: impl Into<String>) -> Result<RoleGetResponse> {
-        let name = name.into();
-        failover!(self, Repeatable, auth, role_get, name)
+        self.auth.role_get(name).await
     }
 
     /// Lists role.
     #[inline]
     pub async fn role_list(&mut self) -> Result<RoleListResponse> {
-        failover!(self, Repeatable, auth, role_list)
+        self.auth.role_list().await
     }
 
     /// Grants role permission.
@@ -689,8 +603,7 @@ impl Client {
         name: impl Into<String>,
         perm: Permission,
     ) -> Result<RoleGrantPermissionResponse> {
-        let name = name.into();
-        failover!(self, NonRepeatable, auth, role_grant_permission, name, perm)
+        self.auth.role_grant_permission(name, perm).await
     }
 
     /// Revokes role permission.
@@ -701,16 +614,7 @@ impl Client {
         key: impl Into<Vec<u8>>,
         options: Option<RoleRevokePermissionOptions>,
     ) -> Result<RoleRevokePermissionResponse> {
-        let (name, key) = (name.into(), key.into());
-        failover!(
-            self,
-            NonRepeatable,
-            auth,
-            role_revoke_permission,
-            name,
-            key,
-            options
-        )
+        self.auth.role_revoke_permission(name, key, options).await
     }
 
     /// Add an user.
@@ -721,28 +625,25 @@ impl Client {
         password: impl Into<String>,
         options: Option<UserAddOptions>,
     ) -> Result<UserAddResponse> {
-        let (name, password) = (name.into(), password.into());
-        failover!(self, NonRepeatable, auth, user_add, name, password, options)
+        self.auth.user_add(name, password, options).await
     }
 
     /// Gets the user info by the user name.
     #[inline]
     pub async fn user_get(&mut self, name: impl Into<String>) -> Result<UserGetResponse> {
-        let name = name.into();
-        failover!(self, Repeatable, auth, user_get, name)
+        self.auth.user_get(name).await
     }
 
     /// Lists all users.
     #[inline]
     pub async fn user_list(&mut self) -> Result<UserListResponse> {
-        failover!(self, Repeatable, auth, user_list)
+        self.auth.user_list().await
     }
 
     /// Deletes the given key from the key-value store.
     #[inline]
     pub async fn user_delete(&mut self, name: impl Into<String>) -> Result<UserDeleteResponse> {
-        let name = name.into();
-        failover!(self, NonRepeatable, auth, user_delete, name)
+        self.auth.user_delete(name).await
     }
 
     /// Change password for an user.
@@ -752,15 +653,7 @@ impl Client {
         name: impl Into<String>,
         password: impl Into<String>,
     ) -> Result<UserChangePasswordResponse> {
-        let (name, password) = (name.into(), password.into());
-        failover!(
-            self,
-            NonRepeatable,
-            auth,
-            user_change_password,
-            name,
-            password
-        )
+        self.auth.user_change_password(name, password).await
     }
 
     /// Grant role for an user.
@@ -770,8 +663,7 @@ impl Client {
         user: impl Into<String>,
         role: impl Into<String>,
     ) -> Result<UserGrantRoleResponse> {
-        let (user, role) = (user.into(), role.into());
-        failover!(self, NonRepeatable, auth, user_grant_role, user, role)
+        self.auth.user_grant_role(user, role).await
     }
 
     /// Revoke role for an user.
@@ -781,8 +673,7 @@ impl Client {
         user: impl Into<String>,
         role: impl Into<String>,
     ) -> Result<UserRevokeRoleResponse> {
-        let (user, role) = (user.into(), role.into());
-        failover!(self, NonRepeatable, auth, user_revoke_role, user, role)
+        self.auth.user_revoke_role(user, role).await
     }
 
     /// Maintain(get, active or inactive) alarms of members.
@@ -793,27 +684,21 @@ impl Client {
         alarm_type: AlarmType,
         options: Option<AlarmOptions>,
     ) -> Result<AlarmResponse> {
-        failover!(
-            self,
-            Repeatable,
-            maintenance,
-            alarm,
-            alarm_action,
-            alarm_type,
-            options
-        )
+        self.maintenance
+            .alarm(alarm_action, alarm_type, options)
+            .await
     }
 
     /// Gets the status of a member.
     #[inline]
     pub async fn status(&mut self) -> Result<StatusResponse> {
-        failover!(self, Repeatable, maintenance, status)
+        self.maintenance.status().await
     }
 
     /// Defragments a member's backend database to recover storage space.
     #[inline]
     pub async fn defragment(&mut self) -> Result<DefragmentResponse> {
-        failover!(self, NonRepeatable, maintenance, defragment)
+        self.maintenance.defragment().await
     }
 
     /// Computes the hash of whole backend keyspace.
@@ -821,21 +706,21 @@ impl Client {
     /// This is designed for testing ONLY!
     #[inline]
     pub async fn hash(&mut self) -> Result<HashResponse> {
-        failover!(self, Repeatable, maintenance, hash)
+        self.maintenance.hash().await
     }
 
     /// Computes the hash of all MVCC keys up to a given revision.
     /// It only iterates \"key\" bucket in backend storage.
     #[inline]
     pub async fn hash_kv(&mut self, revision: i64) -> Result<HashKvResponse> {
-        failover!(self, Repeatable, maintenance, hash_kv, revision)
+        self.maintenance.hash_kv(revision).await
     }
 
     /// Gets a snapshot of the entire backend from a member over a stream to a client.
     /// Only the stream establishment is retried under `failover`.
     #[inline]
     pub async fn snapshot(&mut self) -> Result<SnapshotStreaming> {
-        failover!(self, Repeatable, maintenance, snapshot)
+        self.maintenance.snapshot().await
     }
 
     /// Adds current connected server as a member.
@@ -855,13 +740,14 @@ impl Client {
             };
             eps.push(url);
         }
-        failover!(self, NonRepeatable, cluster, member_add, eps, options)
+
+        self.cluster.member_add(eps, options).await
     }
 
     /// Remove a member.
     #[inline]
     pub async fn member_remove(&mut self, id: u64) -> Result<MemberRemoveResponse> {
-        failover!(self, NonRepeatable, cluster, member_remove, id)
+        self.cluster.member_remove(id).await
     }
 
     /// Updates the member.
@@ -871,26 +757,25 @@ impl Client {
         id: u64,
         url: impl Into<Vec<String>>,
     ) -> Result<MemberUpdateResponse> {
-        let url = url.into();
-        failover!(self, NonRepeatable, cluster, member_update, id, url)
+        self.cluster.member_update(id, url).await
     }
 
     /// Promotes the member.
     #[inline]
     pub async fn member_promote(&mut self, id: u64) -> Result<MemberPromoteResponse> {
-        failover!(self, NonRepeatable, cluster, member_promote, id)
+        self.cluster.member_promote(id).await
     }
 
     /// Lists members.
     #[inline]
     pub async fn member_list(&mut self) -> Result<MemberListResponse> {
-        failover!(self, Repeatable, cluster, member_list)
+        self.cluster.member_list().await
     }
 
     /// Moves the current leader node to target node.
     #[inline]
     pub async fn move_leader(&mut self, target_id: u64) -> Result<MoveLeaderResponse> {
-        failover!(self, Repeatable, maintenance, move_leader, target_id)
+        self.maintenance.move_leader(target_id).await
     }
 
     /// Puts a value as eligible for the election on the prefix key.
@@ -903,8 +788,7 @@ impl Client {
         value: impl Into<Vec<u8>>,
         lease: i64,
     ) -> Result<CampaignResponse> {
-        let (name, value) = (name.into(), value.into());
-        failover!(self, NonRepeatable, election, campaign, name, value, lease)
+        self.election.campaign(name, value, lease).await
     }
 
     /// Lets the leader announce a new value without another election.
@@ -914,29 +798,26 @@ impl Client {
         value: impl Into<Vec<u8>>,
         options: Option<ProclaimOptions>,
     ) -> Result<ProclaimResponse> {
-        let value = value.into();
-        failover!(self, NonRepeatable, election, proclaim, value, options)
+        self.election.proclaim(value, options).await
     }
 
     /// Returns the leader value for the current election.
     #[inline]
     pub async fn leader(&mut self, name: impl Into<Vec<u8>>) -> Result<LeaderResponse> {
-        let name = name.into();
-        failover!(self, Repeatable, election, leader, name)
+        self.election.leader(name).await
     }
 
     /// Returns a channel that reliably observes ordered leader proposals
     /// as GetResponse values on every current elected leader key.
     #[inline]
     pub async fn observe(&mut self, name: impl Into<Vec<u8>>) -> Result<ObserveStream> {
-        let name = name.into();
-        failover!(self, Repeatable, election, observe, name)
+        self.election.observe(name).await
     }
 
     /// Releases election leadership and then start a new election
     #[inline]
     pub async fn resign(&mut self, option: Option<ResignOptions>) -> Result<ResignResponse> {
-        failover!(self, NonRepeatable, election, resign, option)
+        self.election.resign(option).await
     }
 
     /// Refresh the authentication token if the client has credentials options.
@@ -1175,7 +1056,7 @@ impl From<&ConnectOptions> for CallOptions {
     fn from(options: &ConnectOptions) -> Self {
         Self {
             creds: Arc::new(RwLock::new(options.user.clone())),
-            // `run_failover` already re-authenticates on any auth-token error,
+            // `do_call` already re-authenticates on any auth-token error,
             // so leaving the per-call refresh on would nest a second retry loop
             // and clone every request twice.
             #[cfg(feature = "failover")]

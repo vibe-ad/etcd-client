@@ -2,6 +2,7 @@
 
 pub use crate::rpc::pb::authpb::permission::Type as PermissionType;
 
+use crate::caller::{ClientCaller, ClientCallerBuilder, RetryPolicy};
 use crate::error::Result;
 use crate::intercept::InterceptedChannel;
 use crate::rpc::pb::authpb::{Permission as PbPermission, UserAddOptions as PbUserAddOptions};
@@ -35,40 +36,65 @@ use crate::rpc::ResponseHeader;
 use crate::rpc::{get_prefix, KeyRange};
 use tonic::{IntoRequest, Request};
 
+/// The raw auth client `ClientCaller` authenticates with. Not [`AuthClient`],
+/// which itself wraps a `ClientCaller`.
+pub(crate) type RawAuthClient = PbAuthClient<InterceptedChannel>;
+
 /// Client for Auth operations.
+#[repr(transparent)]
 #[derive(Clone)]
 pub struct AuthClient {
-    inner: PbAuthClient<InterceptedChannel>,
+    inner: ClientCaller<RawAuthClient>,
 }
 
 impl AuthClient {
-    /// Creates an auth client.
+    /// Creates an auth client. Its calls never refresh an expired token outside
+    /// `failover`, as upstream, whatever `with_auto_token_refresh` says.
     #[inline]
-    pub(crate) fn new(channel: InterceptedChannel) -> Self {
-        let inner = PbAuthClient::new(channel);
-        Self { inner }
+    pub(crate) fn new(builder: ClientCallerBuilder) -> Self {
+        Self {
+            inner: builder.without_token_refresh().build(RawAuthClient::new),
+        }
     }
 
     /// Enables authentication for the etcd cluster.
     #[inline]
     pub async fn auth_enable(&mut self) -> Result<AuthEnableResponse> {
-        let resp = self
-            .inner
-            .auth_enable(AuthEnableOptions::new())
-            .await?
-            .into_inner();
-        Ok(AuthEnableResponse::new(resp))
+        async fn auth_enable_impl(
+            client: &mut RawAuthClient,
+            req: AuthEnableOptions,
+        ) -> Result<AuthEnableResponse> {
+            Ok(AuthEnableResponse::new(
+                client.auth_enable(req).await?.into_inner(),
+            ))
+        }
+        self.inner
+            .do_call(
+                RetryPolicy::NonRepeatable,
+                AuthEnableOptions::new(),
+                auth_enable_impl,
+            )
+            .await
     }
 
     /// Disables authentication for the etcd cluster.
     #[inline]
     pub async fn auth_disable(&mut self) -> Result<AuthDisableResponse> {
-        let resp = self
-            .inner
-            .auth_disable(AuthDisableOptions::new())
-            .await?
-            .into_inner();
-        Ok(AuthDisableResponse::new(resp))
+        async fn auth_disable_impl(
+            client: &mut RawAuthClient,
+            req: AuthDisableOptions,
+        ) -> Result<AuthDisableResponse> {
+            Ok(AuthDisableResponse::new(
+                client.auth_disable(req).await?.into_inner(),
+            ))
+        }
+        self.inner
+            .do_call(
+                RetryPolicy::NonRepeatable,
+                AuthDisableOptions::new(),
+                auth_disable_impl,
+            )
+            .await
     }
 
     /// Sends an authenticate request.
@@ -81,56 +107,101 @@ impl AuthClient {
         name: String,
         password: String,
     ) -> Result<AuthenticateResponse> {
-        let resp = self
-            .inner
-            .authenticate(AuthenticateOptions::new().with_user(name, password))
-            .await?
-            .into_inner();
-        Ok(AuthenticateResponse::new(resp))
+        async fn authenticate_impl(
+            client: &mut RawAuthClient,
+            req: AuthenticateOptions,
+        ) -> Result<AuthenticateResponse> {
+            Ok(AuthenticateResponse::new(
+                client.authenticate(req).await?.into_inner(),
+            ))
+        }
+        self.inner
+            .do_call(
+                RetryPolicy::Repeatable,
+                AuthenticateOptions::new().with_user(name, password),
+                authenticate_impl,
+            )
+            .await
     }
 
     /// Adds role
     #[inline]
     pub async fn role_add(&mut self, name: impl Into<String>) -> Result<RoleAddResponse> {
-        let resp = self
-            .inner
-            .role_add(RoleAddOptions::new(name.into()))
-            .await?
-            .into_inner();
-        Ok(RoleAddResponse::new(resp))
+        async fn role_add_impl(
+            client: &mut RawAuthClient,
+            req: RoleAddOptions,
+        ) -> Result<RoleAddResponse> {
+            Ok(RoleAddResponse::new(
+                client.role_add(req).await?.into_inner(),
+            ))
+        }
+        self.inner
+            .do_call(
+                RetryPolicy::NonRepeatable,
+                RoleAddOptions::new(name.into()),
+                role_add_impl,
+            )
+            .await
     }
 
     /// Deletes role
     #[inline]
     pub async fn role_delete(&mut self, name: impl Into<String>) -> Result<RoleDeleteResponse> {
-        let resp = self
-            .inner
-            .role_delete(RoleDeleteOptions::new(name.into()))
-            .await?
-            .into_inner();
-        Ok(RoleDeleteResponse::new(resp))
+        async fn role_delete_impl(
+            client: &mut RawAuthClient,
+            req: RoleDeleteOptions,
+        ) -> Result<RoleDeleteResponse> {
+            Ok(RoleDeleteResponse::new(
+                client.role_delete(req).await?.into_inner(),
+            ))
+        }
+        self.inner
+            .do_call(
+                RetryPolicy::NonRepeatable,
+                RoleDeleteOptions::new(name.into()),
+                role_delete_impl,
+            )
+            .await
     }
 
     /// Gets role
     #[inline]
     pub async fn role_get(&mut self, name: impl Into<String>) -> Result<RoleGetResponse> {
-        let resp = self
-            .inner
-            .role_get(RoleGetOptions::new(name.into()))
-            .await?
-            .into_inner();
-        Ok(RoleGetResponse::new(resp))
+        async fn role_get_impl(
+            client: &mut RawAuthClient,
+            req: RoleGetOptions,
+        ) -> Result<RoleGetResponse> {
+            Ok(RoleGetResponse::new(
+                client.role_get(req).await?.into_inner(),
+            ))
+        }
+        self.inner
+            .do_call(
+                RetryPolicy::Repeatable,
+                RoleGetOptions::new(name.into()),
+                role_get_impl,
+            )
+            .await
     }
 
     /// Lists role
     #[inline]
     pub async fn role_list(&mut self) -> Result<RoleListResponse> {
-        let resp = self
-            .inner
-            .role_list(AuthRoleListOptions {})
-            .await?
-            .into_inner();
-        Ok(RoleListResponse::new(resp))
+        async fn role_list_impl(
+            client: &mut RawAuthClient,
+            req: AuthRoleListOptions,
+        ) -> Result<RoleListResponse> {
+            Ok(RoleListResponse::new(
+                client.role_list(req).await?.into_inner(),
+            ))
+        }
+        self.inner
+            .do_call(
+                RetryPolicy::Repeatable,
+                AuthRoleListOptions {},
+                role_list_impl,
+            )
+            .await
     }
 
     /// Grants role permission
@@ -140,12 +211,21 @@ impl AuthClient {
         name: impl Into<String>,
         perm: Permission,
     ) -> Result<RoleGrantPermissionResponse> {
-        let resp = self
-            .inner
-            .role_grant_permission(RoleGrantPermissionOptions::new(name.into(), perm))
-            .await?
-            .into_inner();
-        Ok(RoleGrantPermissionResponse::new(resp))
+        async fn role_grant_permission_impl(
+            client: &mut RawAuthClient,
+            req: RoleGrantPermissionOptions,
+        ) -> Result<RoleGrantPermissionResponse> {
+            Ok(RoleGrantPermissionResponse::new(
+                client.role_grant_permission(req).await?.into_inner(),
+            ))
+        }
+        self.inner
+            .do_call(
+                RetryPolicy::NonRepeatable,
+                RoleGrantPermissionOptions::new(name.into(), perm),
+                role_grant_permission_impl,
+            )
+            .await
     }
 
     /// Revokes role permission
@@ -156,17 +236,24 @@ impl AuthClient {
         key: impl Into<Vec<u8>>,
         options: Option<RoleRevokePermissionOptions>,
     ) -> Result<RoleRevokePermissionResponse> {
-        let resp = self
-            .inner
-            .role_revoke_permission(
+        async fn role_revoke_permission_impl(
+            client: &mut RawAuthClient,
+            req: RoleRevokePermissionOptions,
+        ) -> Result<RoleRevokePermissionResponse> {
+            Ok(RoleRevokePermissionResponse::new(
+                client.role_revoke_permission(req).await?.into_inner(),
+            ))
+        }
+        self.inner
+            .do_call(
+                RetryPolicy::NonRepeatable,
                 options
                     .unwrap_or_default()
                     .with_name(name.into())
                     .with_key(key.into()),
+                role_revoke_permission_impl,
             )
-            .await?
-            .into_inner();
-        Ok(RoleRevokePermissionResponse::new(resp))
+            .await
     }
 
     /// Adds user
@@ -177,50 +264,84 @@ impl AuthClient {
         password: impl Into<String>,
         options: Option<UserAddOptions>,
     ) -> Result<UserAddResponse> {
-        let resp = self
-            .inner
-            .user_add(
+        async fn user_add_impl(
+            client: &mut RawAuthClient,
+            req: UserAddOptions,
+        ) -> Result<UserAddResponse> {
+            Ok(UserAddResponse::new(
+                client.user_add(req).await?.into_inner(),
+            ))
+        }
+        self.inner
+            .do_call(
+                RetryPolicy::NonRepeatable,
                 options
                     .unwrap_or_default()
                     .with_name(name.into())
                     .with_pwd(password.into()),
+                user_add_impl,
             )
-            .await?
-            .into_inner();
-        Ok(UserAddResponse::new(resp))
+            .await
     }
 
     /// Gets user
     #[inline]
     pub async fn user_get(&mut self, name: impl Into<String>) -> Result<UserGetResponse> {
-        let resp = self
-            .inner
-            .user_get(UserGetOptions::new(name.into()))
-            .await?
-            .into_inner();
-        Ok(UserGetResponse::new(resp))
+        async fn user_get_impl(
+            client: &mut RawAuthClient,
+            req: UserGetOptions,
+        ) -> Result<UserGetResponse> {
+            Ok(UserGetResponse::new(
+                client.user_get(req).await?.into_inner(),
+            ))
+        }
+        self.inner
+            .do_call(
+                RetryPolicy::Repeatable,
+                UserGetOptions::new(name.into()),
+                user_get_impl,
+            )
+            .await
     }
 
     /// Lists user
     #[inline]
     pub async fn user_list(&mut self) -> Result<UserListResponse> {
-        let resp = self
-            .inner
-            .user_list(AuthUserListOptions {})
-            .await?
-            .into_inner();
-        Ok(UserListResponse::new(resp))
+        async fn user_list_impl(
+            client: &mut RawAuthClient,
+            req: AuthUserListOptions,
+        ) -> Result<UserListResponse> {
+            Ok(UserListResponse::new(
+                client.user_list(req).await?.into_inner(),
+            ))
+        }
+        self.inner
+            .do_call(
+                RetryPolicy::Repeatable,
+                AuthUserListOptions {},
+                user_list_impl,
+            )
+            .await
     }
 
     /// Deletes user
     #[inline]
     pub async fn user_delete(&mut self, name: impl Into<String>) -> Result<UserDeleteResponse> {
-        let resp = self
-            .inner
-            .user_delete(UserDeleteOptions::new(name.into()))
-            .await?
-            .into_inner();
-        Ok(UserDeleteResponse::new(resp))
+        async fn user_delete_impl(
+            client: &mut RawAuthClient,
+            req: UserDeleteOptions,
+        ) -> Result<UserDeleteResponse> {
+            Ok(UserDeleteResponse::new(
+                client.user_delete(req).await?.into_inner(),
+            ))
+        }
+        self.inner
+            .do_call(
+                RetryPolicy::NonRepeatable,
+                UserDeleteOptions::new(name.into()),
+                user_delete_impl,
+            )
+            .await
     }
 
     /// Change user's password
@@ -230,12 +351,21 @@ impl AuthClient {
         name: impl Into<String>,
         password: impl Into<String>,
     ) -> Result<UserChangePasswordResponse> {
-        let resp = self
-            .inner
-            .user_change_password(UserChangePasswordOptions::new(name.into(), password.into()))
-            .await?
-            .into_inner();
-        Ok(UserChangePasswordResponse::new(resp))
+        async fn user_change_password_impl(
+            client: &mut RawAuthClient,
+            req: UserChangePasswordOptions,
+        ) -> Result<UserChangePasswordResponse> {
+            Ok(UserChangePasswordResponse::new(
+                client.user_change_password(req).await?.into_inner(),
+            ))
+        }
+        self.inner
+            .do_call(
+                RetryPolicy::NonRepeatable,
+                UserChangePasswordOptions::new(name.into(), password.into()),
+                user_change_password_impl,
+            )
+            .await
     }
 
     /// Grant role for an user
@@ -245,12 +375,21 @@ impl AuthClient {
         name: impl Into<String>,
         role: impl Into<String>,
     ) -> Result<UserGrantRoleResponse> {
-        let resp = self
-            .inner
-            .user_grant_role(UserGrantRoleOptions::new(name.into(), role.into()))
-            .await?
-            .into_inner();
-        Ok(UserGrantRoleResponse::new(resp))
+        async fn user_grant_role_impl(
+            client: &mut RawAuthClient,
+            req: UserGrantRoleOptions,
+        ) -> Result<UserGrantRoleResponse> {
+            Ok(UserGrantRoleResponse::new(
+                client.user_grant_role(req).await?.into_inner(),
+            ))
+        }
+        self.inner
+            .do_call(
+                RetryPolicy::NonRepeatable,
+                UserGrantRoleOptions::new(name.into(), role.into()),
+                user_grant_role_impl,
+            )
+            .await
     }
 
     /// Revoke role for an user
@@ -260,12 +399,21 @@ impl AuthClient {
         name: impl Into<String>,
         role: impl Into<String>,
     ) -> Result<UserRevokeRoleResponse> {
-        let resp = self
-            .inner
-            .user_revoke_role(UserRevokeRoleOptions::new(name.into(), role.into()))
-            .await?
-            .into_inner();
-        Ok(UserRevokeRoleResponse::new(resp))
+        async fn user_revoke_role_impl(
+            client: &mut RawAuthClient,
+            req: UserRevokeRoleOptions,
+        ) -> Result<UserRevokeRoleResponse> {
+            Ok(UserRevokeRoleResponse::new(
+                client.user_revoke_role(req).await?.into_inner(),
+            ))
+        }
+        self.inner
+            .do_call(
+                RetryPolicy::NonRepeatable,
+                UserRevokeRoleOptions::new(name.into(), role.into()),
+                user_revoke_role_impl,
+            )
+            .await
     }
 }
 
@@ -381,7 +529,7 @@ pub struct AuthenticateOptions(PbAuthenticateRequest);
 impl AuthenticateOptions {
     /// Sets user's name and password.
     #[inline]
-    fn with_user(mut self, name: String, password: String) -> Self {
+    pub(crate) fn with_user(mut self, name: String, password: String) -> Self {
         self.0.name = name;
         self.0.password = password;
         self
@@ -420,7 +568,7 @@ pub struct AuthenticateResponse(PbAuthenticateResponse);
 impl AuthenticateResponse {
     /// Creates a new `AuthenticateResponse` from pb auth response.
     #[inline]
-    const fn new(resp: PbAuthenticateResponse) -> Self {
+    pub(crate) const fn new(resp: PbAuthenticateResponse) -> Self {
         Self(resp)
     }
 

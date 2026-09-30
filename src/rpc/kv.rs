@@ -1,6 +1,6 @@
 //! Etcd KV Operations.
 
-use crate::caller::{ClientCaller, ClientCallerBuilder};
+use crate::caller::{ClientCaller, ClientCallerBuilder, RetryPolicy};
 pub use crate::rpc::pb::etcdserverpb::compare::CompareResult as CompareOp;
 pub use crate::rpc::pb::etcdserverpb::range_request::{SortOrder, SortTarget};
 
@@ -76,7 +76,11 @@ impl KvClient {
             Ok(PutResponse::new(resp))
         }
         self.inner
-            .do_call(options.unwrap_or_default().with_kv(key, value), put_impl)
+            .do_call(
+                RetryPolicy::NonRepeatable,
+                options.unwrap_or_default().with_kv(key, value),
+                put_impl,
+            )
             .await
     }
 
@@ -92,7 +96,11 @@ impl KvClient {
             Ok(GetResponse::new(resp))
         }
         self.inner
-            .do_call(options.unwrap_or_default().with_key(key.into()), get_impl)
+            .do_call(
+                RetryPolicy::Repeatable,
+                options.unwrap_or_default().with_key(key.into()),
+                get_impl,
+            )
             .await
     }
 
@@ -109,6 +117,7 @@ impl KvClient {
         }
         self.inner
             .do_call(
+                RetryPolicy::NonRepeatable,
                 options.unwrap_or_default().with_key(key.into()),
                 delete_impl,
             )
@@ -133,6 +142,7 @@ impl KvClient {
         }
         self.inner
             .do_call(
+                RetryPolicy::NonRepeatable,
                 options.unwrap_or_default().with_revision(revision),
                 compact_impl,
             )
@@ -149,7 +159,9 @@ impl KvClient {
             let resp = client.txn(txn).await?.into_inner();
             Ok(TxnResponse::new(resp))
         }
-        self.inner.do_call(txn, txn_impl).await
+        self.inner
+            .do_call(RetryPolicy::NonRepeatable, txn, txn_impl)
+            .await
     }
 }
 

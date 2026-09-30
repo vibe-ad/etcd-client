@@ -115,7 +115,8 @@ async fn dead_endpoint_reads_and_writes_succeed() -> Result<()> {
 
 /// Reads keep succeeding when an endpoint dies mid-session. Calls in flight at
 /// the kill are severed (`Unknown`, broken pipe), later ones hit the refused
-/// reconnect (`Unavailable`), and both must fail over.
+/// reconnect (`Unavailable`), and both must fail over. Half the readers go
+/// through a raw `KvClient`, which must fail over the same way as `Client`.
 #[tokio::test(flavor = "multi_thread")]
 async fn reads_survive_an_endpoint_killed_mid_session() -> Result<()> {
     let (proxy, proxy_task) = spawn_proxy().await;
@@ -133,13 +134,17 @@ async fn reads_survive_an_endpoint_killed_mid_session() -> Result<()> {
     }
 
     let mut readers = JoinSet::new();
-    for _ in 0..16 {
+    for i in 0..16 {
         let mut client = client.clone();
+        let mut kv = client.kv_client();
         readers.spawn(async move {
             for _ in 0..200 {
-                let resp = client
-                    .get(prefix, Some(GetOptions::new().with_prefix()))
-                    .await?;
+                let options = Some(GetOptions::new().with_prefix());
+                let resp = if i % 2 == 0 {
+                    client.get(prefix, options).await?
+                } else {
+                    kv.get(prefix, options).await?
+                };
                 assert_eq!(resp.kvs().len(), 10);
             }
             Ok::<_, Error>(())
@@ -153,6 +158,37 @@ async fn reads_survive_an_endpoint_killed_mid_session() -> Result<()> {
 
     client
         .delete(prefix, Some(DeleteOptions::new().with_prefix()))
+        .await?;
+    Ok(())
+}
+
+/// Every sub-client obtained from a getter fails over around a dead endpoint,
+/// not only the calls made on `Client`.
+#[tokio::test]
+async fn sub_clients_fail_over_around_dead_endpoint() -> Result<()> {
+    let options = ConnectOptions::new().with_connect_timeout(Duration::from_secs(1));
+    let client = Client::connect(dead_and_healthy(), Some(options)).await?;
+    let (mut kv, mut lease, mut auth, mut maintenance, mut cluster) = (
+        client.kv_client(),
+        client.lease_client(),
+        client.auth_client(),
+        client.maintenance_client(),
+        client.cluster_client(),
+    );
+
+    for i in 0..20 {
+        let key = format!("failover-sub/{i}");
+        kv.put(key.clone(), "v", None).await?;
+        let resp = kv.get(key, None).await?;
+        assert_eq!(resp.kvs().first().map(|kv| kv.value()), Some(&b"v"[..]));
+        let grant = lease.grant(60, None).await?;
+        lease.revoke(grant.id()).await?;
+        auth.role_list().await?;
+        maintenance.status().await?;
+        assert!(!cluster.member_list().await?.members().is_empty());
+    }
+
+    kv.delete("failover-sub/", Some(DeleteOptions::new().with_prefix()))
         .await?;
     Ok(())
 }
@@ -199,7 +235,7 @@ async fn auth_ops_are_reliable() -> Result<()> {
 
 /// Credentials installed after connect are honoured by the reauth path: the
 /// client was built from options carrying no user, so only the live credential
-/// state can tell `run_failover` there is something to refresh. Mutates global
+/// state can tell `do_call` there is something to refresh. Mutates global
 /// auth state, so it is ignored by default. Run in isolation:
 /// `cargo test --features failover --test failover -- --ignored reauth_after`.
 ///

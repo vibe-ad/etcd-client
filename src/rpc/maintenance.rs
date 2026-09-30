@@ -1,6 +1,6 @@
 //! Etcd Maintenance RPC.
 
-use crate::caller::{ClientCaller, ClientCallerBuilder};
+use crate::caller::{ClientCaller, ClientCallerBuilder, RetryPolicy};
 pub use crate::rpc::pb::etcdserverpb::alarm_request::AlarmAction;
 pub use crate::rpc::pb::etcdserverpb::AlarmType;
 
@@ -576,6 +576,7 @@ impl MaintenanceClient {
         }
         self.inner
             .do_call(
+                RetryPolicy::Repeatable,
                 options
                     .unwrap_or_default()
                     .with_action_and_type(alarm_action, alarm_type),
@@ -594,7 +595,9 @@ impl MaintenanceClient {
             let resp = client.status(options).await?.into_inner();
             Ok(StatusResponse::new(resp))
         }
-        self.inner.do_call(StatusOptions::new(), status_impl).await
+        self.inner
+            .do_call(RetryPolicy::Repeatable, StatusOptions::new(), status_impl)
+            .await
     }
 
     /// Defragment a member's backend database to recover storage space.
@@ -608,7 +611,11 @@ impl MaintenanceClient {
             Ok(DefragmentResponse::new(resp))
         }
         self.inner
-            .do_call(DefragmentOptions::new(), defragment_impl)
+            .do_call(
+                RetryPolicy::NonRepeatable,
+                DefragmentOptions::new(),
+                defragment_impl,
+            )
             .await
     }
 
@@ -621,7 +628,9 @@ impl MaintenanceClient {
             let resp = client.hash(options).await?.into_inner();
             Ok(HashResponse::new(resp))
         }
-        self.inner.do_call(HashOptions::new(), hash_impl).await
+        self.inner
+            .do_call(RetryPolicy::Repeatable, HashOptions::new(), hash_impl)
+            .await
     }
 
     /// Computes the hash of all MVCC keys up to a given revision.
@@ -636,7 +645,11 @@ impl MaintenanceClient {
             Ok(HashKvResponse::new(resp))
         }
         self.inner
-            .do_call(HashKvOptions::new(revision), hash_kv_impl)
+            .do_call(
+                RetryPolicy::Repeatable,
+                HashKvOptions::new(revision),
+                hash_kv_impl,
+            )
             .await
     }
 
@@ -651,7 +664,11 @@ impl MaintenanceClient {
             Ok(SnapshotStreaming(resp))
         }
         self.inner
-            .do_call(SnapshotOptions::new(), snapshot_impl)
+            .do_call(
+                RetryPolicy::Repeatable,
+                SnapshotOptions::new(),
+                snapshot_impl,
+            )
             .await
     }
 
@@ -667,6 +684,7 @@ impl MaintenanceClient {
         }
         self.inner
             .do_call(
+                RetryPolicy::Repeatable,
                 MoveLeaderOptions::new().with_target_id(target_id),
                 move_leader_impl,
             )

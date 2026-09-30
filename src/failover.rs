@@ -2,7 +2,8 @@
 //!
 //! Mirrors etcd's Go `clientv3` retry semantics. This module holds the pure
 //! decision logic (policy, error classification, backoff pacing). The retry
-//! loop itself lives on [`crate::Client`] so it can reuse `refresh_token` for
+//! loop itself lives in `ClientCaller::do_call`, which every
+//! sub-client call goes through, so it can reuse `refresh_token` for
 //! re-authentication. Idempotent (`Repeatable`) RPCs retry on any `Unavailable`.
 //! Mutating (`NonRepeatable`) RPCs retry only when the request provably never
 //! reached a server, preserving write-at-most-once.
@@ -14,14 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tonic::{Code, Status};
 
-/// Whether an RPC may be safely re-issued.
-#[derive(Clone, Copy)]
-pub(crate) enum RetryPolicy {
-    /// Idempotent: safe to retry on any transient error.
-    Repeatable,
-    /// Mutating: retry only when the request provably never reached a server.
-    NonRepeatable,
-}
+pub(crate) use crate::caller::RetryPolicy;
 
 /// How to react to a failed attempt.
 pub(crate) enum Decision {

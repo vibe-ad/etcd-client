@@ -9,9 +9,22 @@ use tonic::{
 };
 
 use crate::{
-    client::AuthToken, error::Result, intercept::InterceptedChannel, lock::RwLockExt, AuthClient,
+    client::AuthToken,
+    error::Result,
+    intercept::InterceptedChannel,
+    lock::RwLockExt,
+    rpc::auth::{AuthenticateOptions, AuthenticateResponse, RawAuthClient},
     Error::GRpcStatus,
 };
+
+/// Whether an RPC may be safely re-issued. Only acted on under `failover`.
+#[derive(Clone, Copy)]
+pub(crate) enum RetryPolicy {
+    /// Idempotent: safe to retry on any transient error.
+    Repeatable,
+    /// Mutating: retry only when the request provably never reached a server.
+    NonRepeatable,
+}
 
 /// Describe the options for the client request caller.
 #[derive(Clone)]
@@ -28,7 +41,7 @@ pub struct CallOptions {
 pub struct ClientCallerBuilder {
     options: CallOptions,
     auth_token: AuthToken,
-    auth_client: AuthClient,
+    auth_client: RawAuthClient,
     channel: InterceptedChannel,
     #[cfg(feature = "failover")]
     retry: crate::failover::RetryConfig,
@@ -39,7 +52,7 @@ impl ClientCallerBuilder {
     pub fn new(
         options: CallOptions,
         auth_token: AuthToken,
-        auth_client: AuthClient,
+        auth_client: RawAuthClient,
         channel: InterceptedChannel,
     ) -> Self {
         Self {
@@ -65,6 +78,12 @@ impl ClientCallerBuilder {
         &self.retry
     }
 
+    /// Disables the per-call token refresh of `do_call_once` for the built callers.
+    pub(crate) fn without_token_refresh(mut self) -> Self {
+        self.options.refresh_expired_token = false;
+        self
+    }
+
     /// Build a new [`ClientCaller`] passing an actual client implementation.
     pub fn build<T>(self, f_inner: impl FnOnce(InterceptedChannel) -> T) -> ClientCaller<T> {
         #[allow(unused_mut)]
@@ -83,14 +102,14 @@ impl ClientCallerBuilder {
 /// This struct is responsible for dispatching the actions required for each
 /// client request. It is parameterized by the inner client implementation, so
 /// it can be reused across different clients. Its main method, [`do_call`],
-/// controls how a user request is performed. Currently, the only supported
-/// feature is automatic authentication token refresh upon expiration.
+/// controls how a user request is performed: automatic authentication token
+/// refresh upon expiration and, under `failover`, request-level failover.
 ///
 /// [`do_call`]: `ClientCaller::do_call`
 #[derive(Clone)]
 pub struct ClientCaller<T> {
     inner: T,
-    auth_client: AuthClient,
+    auth_client: RawAuthClient,
     auth_token: AuthToken,
     options: CallOptions,
     #[cfg(feature = "failover")]
@@ -101,7 +120,7 @@ impl<T> ClientCaller<T> {
     /// Make a new [`ClientCaller`].
     pub fn new(
         inner: T,
-        auth_client: AuthClient,
+        auth_client: RawAuthClient,
         auth_token: AuthToken,
         options: CallOptions,
     ) -> Self {
@@ -167,15 +186,19 @@ impl<T> ClientCaller<T> {
         self
     }
 
-    /// Performs a client request. Takes a request `req` and the function that
-    /// actually sends it.
+    /// Performs a single attempt of a client request, apart from the token
+    /// refresh. Takes a request `req` and the function that actually sends it.
+    /// Stream opens use it because their reconnect loops pace their own retries,
+    /// everything else goes through [`do_call`].
     ///
     /// # Note
     ///
     /// The arguments are separate to support scenarios in which `req` is not
     /// cloned. For example, passing a single closure would require an [`Fn`],
     /// which would likely unconditionally clone the captured request.
-    pub async fn do_call<Req, C, Ret>(&mut self, req: Req, call: C) -> Result<Ret>
+    ///
+    /// [`do_call`]: `ClientCaller::do_call`
+    pub(crate) async fn do_call_once<Req, C, Ret>(&mut self, req: Req, call: C) -> Result<Ret>
     where
         for<'a> C: ClientCall<&'a mut T, Req, Output = Result<Ret>>,
         Req: Clone,
@@ -199,25 +222,92 @@ impl<T> ClientCaller<T> {
         }
     }
 
+    /// Performs a client request. `policy` states whether the RPC is safe to
+    /// repeat. Under `failover` a failed attempt fails over to another endpoint
+    /// as `policy` allows, re-authenticating on token errors. Without it, the
+    /// request is sent as upstream does.
+    #[cfg_attr(not(feature = "failover"), allow(unused_variables))]
+    pub async fn do_call<Req, C, Ret>(
+        &mut self,
+        policy: RetryPolicy,
+        req: Req,
+        call: C,
+    ) -> Result<Ret>
+    where
+        for<'a> C: ClientCall<&'a mut T, Req, Output = Result<Ret>>,
+        Req: Clone,
+    {
+        #[cfg(not(feature = "failover"))]
+        return self.do_call_once(req, call).await;
+
+        #[cfg(feature = "failover")]
+        {
+            use crate::failover::{classify, Decision};
+            let max = self.retry.max_attempts.max(1);
+            let mut last = None;
+            for attempt in 0..max {
+                let wait = self.retry.backoff(attempt);
+                if !wait.is_zero() {
+                    tokio::time::sleep(wait).await;
+                }
+                match (call)(&mut self.inner, req.clone()).await {
+                    Ok(v) => return Ok(v),
+                    Err(e) => match classify(&e, policy) {
+                        Decision::RefreshToken => {
+                            // Without credentials there is nothing to refresh, so
+                            // retrying the same auth error would just burn the budget.
+                            if !self.has_creds() {
+                                return Err(e);
+                            }
+                            tracing::warn!(
+                                target: "etcd_client::failover",
+                                attempt = attempt + 1,
+                                max,
+                                error = %e,
+                                "etcd auth token rejected, refreshing and retrying",
+                            );
+                            // Reauth is best-effort: a refresh that itself fails (for
+                            // example it hit the down endpoint) must not mask the
+                            // original error, so keep it and let the budget continue.
+                            let _ = self.refresh_token().await;
+                            last = Some(e);
+                        }
+                        Decision::Retry => {
+                            tracing::warn!(
+                                target: "etcd_client::failover",
+                                attempt = attempt + 1,
+                                max,
+                                error = %e,
+                                "etcd unary RPC failed, failing over to another endpoint",
+                            );
+                            last = Some(e);
+                        }
+                        Decision::Stop => return Err(e),
+                    },
+                }
+            }
+            Err(last.expect("retry loop runs at least once"))
+        }
+    }
+
     async fn do_authenticate(
         &self,
         user: String,
         password: String,
     ) -> Result<MetadataValue<Ascii>> {
+        let req = AuthenticateOptions::new().with_user(user, password);
+
         #[cfg(not(feature = "failover"))]
-        let resp = self
-            .auth_client
-            .clone()
-            .authenticate(user, password)
-            .await?;
+        let resp = self.auth_client.clone().authenticate(req).await?;
 
         // Authenticate is idempotent (it only mints a token), so fail it over to
         // a healthy endpoint on a transient error. This keeps an authenticated
         // connect and in-flight reauth working when the balancer routes the
-        // authenticate RPC to a down node, the scenario failover targets.
+        // authenticate RPC to a down node, the scenario failover targets. It
+        // cannot go through `do_call`, whose reauth would recurse here.
         #[cfg(feature = "failover")]
         let resp = {
-            use crate::failover::{classify, Decision, RetryPolicy};
+            use crate::failover::{classify, Decision};
             let max = self.retry.max_attempts.max(1);
             let mut last = None;
             let mut ok = None;
@@ -226,29 +316,27 @@ impl<T> ClientCaller<T> {
                 if !wait.is_zero() {
                     tokio::time::sleep(wait).await;
                 }
-                match self
-                    .auth_client
-                    .clone()
-                    .authenticate(user.clone(), password.clone())
-                    .await
-                {
+                match self.auth_client.clone().authenticate(req.clone()).await {
                     Ok(resp) => {
                         ok = Some(resp);
                         break;
                     }
-                    Err(e) => match classify(&e, RetryPolicy::Repeatable) {
-                        Decision::Retry => {
-                            tracing::warn!(
-                                target: "etcd_client::failover",
-                                attempt = attempt + 1,
-                                max,
-                                error = %e,
-                                "etcd authenticate RPC failed, failing over to another endpoint",
-                            );
-                            last = Some(e);
+                    Err(status) => {
+                        let e = crate::Error::from(status);
+                        match classify(&e, RetryPolicy::Repeatable) {
+                            Decision::Retry => {
+                                tracing::warn!(
+                                    target: "etcd_client::failover",
+                                    attempt = attempt + 1,
+                                    max,
+                                    error = %e,
+                                    "etcd authenticate RPC failed, failing over to another endpoint",
+                                );
+                                last = Some(e);
+                            }
+                            _ => return Err(e),
                         }
-                        _ => return Err(e),
-                    },
+                    }
                 }
             }
             match ok {
@@ -257,7 +345,9 @@ impl<T> ClientCaller<T> {
             }
         };
 
-        let token = resp.token().parse()?;
+        let token = AuthenticateResponse::new(resp.into_inner())
+            .token()
+            .parse()?;
         Ok(token)
     }
 }

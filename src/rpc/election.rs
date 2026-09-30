@@ -1,6 +1,6 @@
 //! Etcd Election RPC.
 
-use crate::caller::{ClientCaller, ClientCallerBuilder};
+use crate::caller::{ClientCaller, ClientCallerBuilder, RetryPolicy};
 use crate::error::Result;
 use crate::intercept::InterceptedChannel;
 use crate::rpc::pb::v3electionpb::election_client::ElectionClient as PbElectionClient;
@@ -513,6 +513,7 @@ impl ElectionClient {
 
         self.inner
             .do_call(
+                RetryPolicy::NonRepeatable,
                 CampaignOptions::new()
                     .with_name(name)
                     .with_value(value)
@@ -537,7 +538,11 @@ impl ElectionClient {
             Ok(ProclaimResponse::new(resp))
         }
         self.inner
-            .do_call(options.unwrap_or_default().with_value(value), proclaim_impl)
+            .do_call(
+                RetryPolicy::NonRepeatable,
+                options.unwrap_or_default().with_value(value),
+                proclaim_impl,
+            )
             .await
     }
 
@@ -552,7 +557,11 @@ impl ElectionClient {
             Ok(LeaderResponse::new(resp))
         }
         self.inner
-            .do_call(LeaderOptions::new().with_name(name), leader_impl)
+            .do_call(
+                RetryPolicy::Repeatable,
+                LeaderOptions::new().with_name(name),
+                leader_impl,
+            )
             .await
     }
 
@@ -568,7 +577,11 @@ impl ElectionClient {
             Ok(ObserveStream::new(resp))
         }
         self.inner
-            .do_call(LeaderOptions::new().with_name(name), observe_impl)
+            .do_call(
+                RetryPolicy::Repeatable,
+                LeaderOptions::new().with_name(name),
+                observe_impl,
+            )
             .await
     }
 
@@ -583,7 +596,11 @@ impl ElectionClient {
             Ok(ResignResponse::new(resp))
         }
         self.inner
-            .do_call(option.unwrap_or_default(), resign_impl)
+            .do_call(
+                RetryPolicy::NonRepeatable,
+                option.unwrap_or_default(),
+                resign_impl,
+            )
             .await
     }
 }

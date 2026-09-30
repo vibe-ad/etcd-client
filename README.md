@@ -94,6 +94,8 @@ etcd-client = { version = "0.19", features = ["failover"] }
   retry on transient `Unavailable` errors and fail over to a healthy endpoint.
   tonic reports a connection severed under an in-flight call as `Unknown`, where
   grpc-go reports `Unavailable`, so that case is treated as `Unavailable` too.
+  Retry applies to every call, whether made on `Client` or on a sub-client from
+  `kv_client()`, `auth_client()` and the other getters.
   Mutating RPCs (`put`, `delete`, `txn`, member changes, ...) are retried **only**
   when the request provably never reached a server, preserving
   *write-at-most-once*: a failed write is never silently applied twice.

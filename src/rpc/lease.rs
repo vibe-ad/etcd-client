@@ -1,6 +1,6 @@
 //! Etcd Lease RPC.
 
-use crate::caller::{ClientCaller, ClientCallerBuilder};
+use crate::caller::{ClientCaller, ClientCallerBuilder, RetryPolicy};
 use crate::error::Result;
 use crate::intercept::InterceptedChannel;
 use crate::rpc::pb::etcdserverpb::lease_client::LeaseClient as PbLeaseClient;
@@ -72,7 +72,11 @@ impl LeaseClient {
             ))
         }
         self.inner
-            .do_call(options.unwrap_or_default().with_ttl(ttl), grant_impl)
+            .do_call(
+                RetryPolicy::Repeatable,
+                options.unwrap_or_default().with_ttl(ttl),
+                grant_impl,
+            )
             .await
     }
 
@@ -88,7 +92,11 @@ impl LeaseClient {
         }
 
         self.inner
-            .do_call(LeaseRevokeOptions::new().with_id(id), revoke_impl)
+            .do_call(
+                RetryPolicy::Repeatable,
+                LeaseRevokeOptions::new().with_id(id),
+                revoke_impl,
+            )
             .await
     }
 
@@ -173,7 +181,7 @@ impl LeaseClient {
                 .into_inner();
             Ok((tx, stream))
         }
-        self.inner.do_call(initial, keep_alive_impl).await
+        self.inner.do_call_once(initial, keep_alive_impl).await
     }
 
     /// Open the initial keep-alive stream, failing over to a healthy endpoint on
@@ -225,7 +233,11 @@ impl LeaseClient {
         }
 
         self.inner
-            .do_call(options.unwrap_or_default().with_id(id), time_to_live_impl)
+            .do_call(
+                RetryPolicy::Repeatable,
+                options.unwrap_or_default().with_id(id),
+                time_to_live_impl,
+            )
             .await
     }
 
@@ -241,7 +253,11 @@ impl LeaseClient {
         }
 
         self.inner
-            .do_call(PbLeaseLeasesRequest {}, leases_impl)
+            .do_call(
+                RetryPolicy::Repeatable,
+                PbLeaseLeasesRequest {},
+                leases_impl,
+            )
             .await
     }
 }

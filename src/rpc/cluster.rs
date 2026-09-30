@@ -1,6 +1,6 @@
 //! Etcd Cluster RPC.
 
-use crate::caller::{ClientCaller, ClientCallerBuilder};
+use crate::caller::{ClientCaller, ClientCallerBuilder, RetryPolicy};
 use crate::error::Result;
 use crate::intercept::InterceptedChannel;
 use crate::rpc::pb::etcdserverpb::cluster_client::ClusterClient as PbClusterClient;
@@ -48,7 +48,11 @@ impl ClusterClient {
             Ok(MemberAddResponse::new(resp))
         }
         self.inner
-            .do_call(options.unwrap_or_default().with_urls(urls), member_add_impl)
+            .do_call(
+                RetryPolicy::NonRepeatable,
+                options.unwrap_or_default().with_urls(urls),
+                member_add_impl,
+            )
             .await
     }
 
@@ -63,7 +67,11 @@ impl ClusterClient {
             Ok(MemberRemoveResponse::new(resp))
         }
         self.inner
-            .do_call(MemberRemoveOptions::new().with_id(id), member_remove_impl)
+            .do_call(
+                RetryPolicy::NonRepeatable,
+                MemberRemoveOptions::new().with_id(id),
+                member_remove_impl,
+            )
             .await
     }
 
@@ -83,6 +91,7 @@ impl ClusterClient {
         }
         self.inner
             .do_call(
+                RetryPolicy::NonRepeatable,
                 MemberUpdateOptions::new().with_option(id, url),
                 member_update_impl,
             )
@@ -100,7 +109,11 @@ impl ClusterClient {
             Ok(MemberListResponse::new(resp))
         }
         self.inner
-            .do_call(PbMemberListRequest {}, member_list_impl)
+            .do_call(
+                RetryPolicy::Repeatable,
+                PbMemberListRequest {},
+                member_list_impl,
+            )
             .await
     }
 
@@ -115,7 +128,11 @@ impl ClusterClient {
             Ok(MemberPromoteResponse::new(resp))
         }
         self.inner
-            .do_call(MemberPromoteOptions::new().with_id(id), member_promote_impl)
+            .do_call(
+                RetryPolicy::NonRepeatable,
+                MemberPromoteOptions::new().with_id(id),
+                member_promote_impl,
+            )
             .await
     }
 }

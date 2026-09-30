@@ -135,7 +135,7 @@ impl WatchClient {
             let stream = client.watch(ReceiverStream::new(rx)).await?.into_inner();
             Ok((tx, stream))
         }
-        self.inner.do_call(initial, watch_impl).await
+        self.inner.do_call_once(initial, watch_impl).await
     }
 
     /// Open the initial watch stream, failing over to a healthy endpoint on a

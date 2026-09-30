@@ -1,7 +1,7 @@
 //! Etcd Lock RPC.
 
 use super::pb::v3lockpb;
-use crate::caller::{ClientCaller, ClientCallerBuilder};
+use crate::caller::{ClientCaller, ClientCallerBuilder, RetryPolicy};
 use crate::error::Result;
 use crate::intercept::InterceptedChannel;
 use crate::rpc::ResponseHeader;
@@ -46,7 +46,11 @@ impl LockClient {
             Ok(LockResponse::new(resp))
         }
         self.inner
-            .do_call(options.unwrap_or_default().with_name(name), lock_impl)
+            .do_call(
+                RetryPolicy::NonRepeatable,
+                options.unwrap_or_default().with_name(name),
+                lock_impl,
+            )
             .await
     }
 
@@ -63,7 +67,11 @@ impl LockClient {
             Ok(UnlockResponse::new(resp))
         }
         self.inner
-            .do_call(UnlockOptions::new().with_key(key), unlock_impl)
+            .do_call(
+                RetryPolicy::Repeatable,
+                UnlockOptions::new().with_key(key),
+                unlock_impl,
+            )
             .await
     }
 }
