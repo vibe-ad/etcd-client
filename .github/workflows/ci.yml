@@ -49,6 +49,8 @@ jobs:
           -D warnings
       - name: unit test
         run: cargo test
+      - name: failover test
+        run: cargo test --features failover
       - run: cargo run --example kv
       - run: cargo run --example lease
       - run: cargo run --example lock
