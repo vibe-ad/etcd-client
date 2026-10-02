@@ -1,6 +1,6 @@
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-#[cfg(feature = "tls-openssl")]
+#[cfg(any(feature = "tls-openssl", feature = "failover"))]
 use std::sync::{Mutex, MutexGuard};
 
 pub trait RwLockExt<T: ?Sized> {
@@ -30,12 +30,12 @@ impl<T: ?Sized> RwLockExt<T> for RwLock<T> {
     }
 }
 
-#[cfg(feature = "tls-openssl")]
+#[cfg(any(feature = "tls-openssl", feature = "failover"))]
 pub trait MutexExt<T: ?Sized> {
     fn lock_unpoisoned(&self) -> MutexGuard<'_, T>;
 }
 
-#[cfg(feature = "tls-openssl")]
+#[cfg(any(feature = "tls-openssl", feature = "failover"))]
 impl<T: ?Sized> MutexExt<T> for Mutex<T> {
     fn lock_unpoisoned(&self) -> MutexGuard<'_, T> {
         match self.lock() {

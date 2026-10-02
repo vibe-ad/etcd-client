@@ -120,7 +120,7 @@ impl Client {
         }
 
         #[cfg(feature = "failover")]
-        let retry = Self::build_retry_config(&options, endpoints.len());
+        let retry = Self::build_retry_config(&options, endpoints.iter().map(|e| e.uri().clone()));
         let auth_token = Arc::new(RwLock::new(None));
 
         // Always use balance strategy even if there is only one endpoint.
@@ -170,7 +170,7 @@ impl Client {
         // A raw channel has no managed endpoint list, so pace retries as if
         // single-endpoint. Failover still works if the channel is balanced.
         #[cfg(feature = "failover")]
-        let retry = Self::build_retry_config(&options, 1);
+        let retry = Self::build_retry_config(&options, []);
         let client = Self::build_client(
             channel,
             None,
@@ -311,25 +311,23 @@ impl Client {
         }
     }
 
-    /// Derives the retry config from options and the endpoint count.
+    /// Derives the retry config from options and the managed endpoints.
     #[cfg(feature = "failover")]
     fn build_retry_config(
         options: &ConnectOptions,
-        endpoint_count: usize,
+        endpoints: impl IntoIterator<Item = Uri>,
     ) -> crate::failover::RetryConfig {
-        let max_attempts = options
-            .max_retries
-            .unwrap_or_else(|| ((2 * endpoint_count).max(5)) as u32);
         let (wait, jitter) = options
             .retry_backoff
             .unwrap_or((Duration::from_millis(25), 0.10));
-        // Stream auto-reconnect defaults on whenever retry is on.
-        let retry_on = max_attempts > 1;
+        // Stream auto-reconnect defaults on whenever retry is on. A derived
+        // budget is at least 5 attempts, so only an explicit one turns it off.
+        let retry_on = options.max_retries.map_or(true, |n| n > 1);
         crate::failover::RetryConfig::new(
-            max_attempts,
+            options.max_retries,
             wait,
             jitter,
-            endpoint_count,
+            endpoints,
             options.watch_reconnect.unwrap_or(retry_on),
             options.lease_keepalive_reconnect.unwrap_or(retry_on),
         )
@@ -351,11 +349,13 @@ impl Client {
         let Some(tx) = &self.tx else {
             return Err(Error::EndpointsNotManaged);
         };
+        #[cfg(feature = "failover")]
+        let tracked = endpoint.uri().clone();
         tx.send(Change::Insert(endpoint.uri().clone(), endpoint))
             .await
             .map_err(|e| Error::EndpointError(format!("failed to add endpoint because of {e}")))?;
         #[cfg(feature = "failover")]
-        self.retry.endpoint_added();
+        self.retry.endpoint_added(tracked);
         Ok(())
     }
 
@@ -370,11 +370,13 @@ impl Client {
         let Some(tx) = &self.tx else {
             return Err(Error::EndpointsNotManaged);
         };
+        #[cfg(feature = "failover")]
+        let tracked = uri.clone();
         tx.send(Change::Remove(uri)).await.map_err(|e| {
             Error::EndpointError(format!("failed to remove endpoint because of {e}"))
         })?;
         #[cfg(feature = "failover")]
-        self.retry.endpoint_removed();
+        self.retry.endpoint_removed(&tracked);
         Ok(())
     }
 
@@ -965,7 +967,8 @@ impl ConnectOptions {
 
     /// Sets the maximum number of attempts per unary RPC, counting the first
     /// try. On failure the client fails over to another endpoint. `0` or `1`
-    /// disables retry. When unset, a default is derived from the endpoint count.
+    /// disables retry. When unset, the budget is twice the live endpoint count
+    /// (at least 5), and follows `add_endpoint` / `remove_endpoint`.
     ///
     /// Mutating RPCs are only retried when the request provably never reached a
     /// server, preserving write-at-most-once.
@@ -999,7 +1002,12 @@ impl ConnectOptions {
     ///
     /// The reconnection task stops once no watches remain, so a `WatchStream`
     /// whose watches are all cancelled must be re-created rather than reused if
-    /// a new watch is needed after a disconnect.
+    /// a new watch is needed after a disconnect. Fragments of a revision (see
+    /// `WatchOptions::with_fragment`) are merged and delivered as one response,
+    /// so a reconnect mid-revision delivers no duplicates.
+    ///
+    /// A node that silently drops traffic never breaks the stream, so pair this
+    /// with [`ConnectOptions::with_keep_alive`] to detect it.
     #[cfg_attr(docsrs, doc(cfg(feature = "failover")))]
     #[cfg(feature = "failover")]
     #[inline]
@@ -1015,7 +1023,11 @@ impl ConnectOptions {
     /// Reconnection re-primes the lease when the stream is re-established, but
     /// renewal cadence stays driven by the caller pumping
     /// [`LeaseKeeper::keep_alive`]. The client does not auto-renew, nor reap a
-    /// lease that expires while the stream itself stays healthy.
+    /// lease that expires while the stream itself stays healthy. The response to
+    /// that re-prime is not delivered, so each `keep_alive` still gets one.
+    ///
+    /// A node that silently drops traffic never breaks the stream, so pair this
+    /// with [`ConnectOptions::with_keep_alive`] to detect it.
     #[cfg_attr(docsrs, doc(cfg(feature = "failover")))]
     #[cfg(feature = "failover")]
     #[inline]

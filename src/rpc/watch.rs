@@ -1,5 +1,7 @@
 //! Etcd Watch RPC.
 
+#[cfg(feature = "failover")]
+use crate::caller::RetryPolicy;
 use crate::caller::{ClientCaller, ClientCallerBuilder};
 pub use crate::rpc::pb::mvccpb::event::EventType;
 
@@ -24,7 +26,7 @@ type Client = PbWatchClient<InterceptedChannel>;
 #[cfg(feature = "failover")]
 use crate::failover::RetryConfig;
 #[cfg(feature = "failover")]
-use std::collections::{HashMap, HashSet};
+use std::collections::{hash_map::Entry, HashMap, HashSet, VecDeque};
 #[cfg(feature = "failover")]
 use tokio::sync::mpsc::Receiver;
 
@@ -86,9 +88,16 @@ impl WatchClient {
             let mut next_id = 1;
             let id = assign_watch_id(&mut create, &mut next_id, &HashMap::new());
             let from_now = create.start_revision == 0;
-            // Eagerly open so a connect error surfaces from `watch()`, retrying
-            // across endpoints: the single-shot open can land on a down node.
-            let (sender, stream) = self.open_retrying(vec![create.clone().into()]).await?;
+            // Eagerly open so a connect error surfaces from `watch()`, failing
+            // over across endpoints: the single-shot open can land on a down node.
+            let (sender, stream) = self
+                .inner
+                .do_call(
+                    RetryPolicy::Repeatable,
+                    vec![create.clone().into()],
+                    open_stream,
+                )
+                .await?;
             let (user_tx, driver_rx) = channel::<WatchRequest>(100);
             let (out_tx, out_rx) = channel::<Result<WatchResponse>>(100);
             let driver = WatchDriver {
@@ -99,9 +108,15 @@ impl WatchClient {
                     WatchState {
                         create_req: create,
                         from_now,
+                        reauthed: false,
                     },
                 )]),
                 seen_created: HashSet::new(),
+                pending: VecDeque::from([PendingCreate {
+                    id,
+                    registered: true,
+                }]),
+                fragments: HashMap::new(),
                 next_id,
                 reconnect_attempt: 0,
                 req_rx: driver_rx,
@@ -115,58 +130,31 @@ impl WatchClient {
         Ok(WatchStream::new(sender, stream))
     }
 
-    /// Open a fresh gRPC watch stream with `initial` requests queued before the
-    /// stream is established (etcd only emits the first response after a create
-    /// request is buffered).
+    /// Open a fresh gRPC watch stream with `initial` requests queued, in a
+    /// single attempt.
     async fn watch_raw(
         &mut self,
         initial: Vec<WatchRequest>,
     ) -> Result<(Sender<WatchRequest>, Streaming<PbWatchResponse>)> {
-        async fn watch_impl(
-            client: &mut Client,
-            initial: Vec<WatchRequest>,
-        ) -> Result<(Sender<WatchRequest>, Streaming<PbWatchResponse>)> {
-            let (tx, rx) = channel::<WatchRequest>(100);
-            for req in initial {
-                tx.send(req)
-                    .await
-                    .map_err(|e| Error::WatchError(e.to_string()))?;
-            }
-            let stream = client.watch(ReceiverStream::new(rx)).await?.into_inner();
-            Ok((tx, stream))
-        }
-        self.inner.do_call_once(initial, watch_impl).await
+        self.inner.do_call_once(initial, open_stream).await
     }
+}
 
-    /// Open the initial watch stream, failing over to a healthy endpoint on a
-    /// transient error. The balancer can route the single-shot open to a down
-    /// node, so retry it like a repeatable unary RPC (quorum-paced backoff,
-    /// bounded by the retry budget so a total outage still errors).
-    #[cfg(feature = "failover")]
-    async fn open_retrying(
-        &mut self,
-        initial: Vec<WatchRequest>,
-    ) -> Result<(Sender<WatchRequest>, Streaming<PbWatchResponse>)> {
-        use crate::failover::{classify, Decision, RetryPolicy};
-        let max = self.retry.max_attempts.max(1);
-        let mut last = None;
-        for attempt in 0..max {
-            let wait = self.retry.backoff(attempt);
-            if !wait.is_zero() {
-                tokio::time::sleep(wait).await;
-            }
-            match self.watch_raw(initial.clone()).await {
-                Ok(pair) => return Ok(pair),
-                Err(e) => match classify(&e, RetryPolicy::Repeatable) {
-                    Decision::Retry => last = Some(e),
-                    // The sub-client cannot refresh a token, so an auth error
-                    // here is terminal rather than worth burning the budget on.
-                    Decision::Stop | Decision::RefreshToken => return Err(e),
-                },
-            }
-        }
-        Err(last.expect("retry budget runs at least once"))
+/// Open a gRPC watch stream with `initial` requests queued before the stream is
+/// established (etcd only emits the first response after a create request is
+/// buffered).
+async fn open_stream(
+    client: &mut Client,
+    initial: Vec<WatchRequest>,
+) -> Result<(Sender<WatchRequest>, Streaming<PbWatchResponse>)> {
+    let (tx, rx) = channel::<WatchRequest>(100);
+    for req in initial {
+        tx.send(req)
+            .await
+            .map_err(|e| Error::WatchError(e.to_string()))?;
     }
+    let stream = client.watch(ReceiverStream::new(rx)).await?.into_inner();
+    Ok((tx, stream))
 }
 
 /// Options for `Watch` operation.
@@ -682,6 +670,33 @@ struct WatchState {
     /// The watch was requested from "now" (start_revision 0), so it has no
     /// history to replay and its resume point is pinned once created.
     from_now: bool,
+    /// A token rejection already triggered a refresh and resubscribe, so a
+    /// second one in a row is final. Cleared once the create is accepted.
+    reauthed: bool,
+}
+
+/// A create sent on the current stream and not answered yet. etcd answers
+/// creates in send order, and a rejected one with `watch_id = -1` instead of
+/// the requested id, so responses are matched to creates by order.
+#[cfg(feature = "failover")]
+#[derive(Clone, Copy, Debug)]
+struct PendingCreate {
+    id: i64,
+    /// The create owns its registry entry. False for a create reusing the id
+    /// of a live watch: the server rejects it, and the live watch must stay.
+    registered: bool,
+}
+
+/// What the driver does with a response once the registry is updated.
+#[cfg(feature = "failover")]
+#[derive(Debug, PartialEq, Eq)]
+enum Delivery {
+    Forward,
+    /// Not for the caller: a duplicate `created` ack after a replay, or a
+    /// fragment held until the rest of its revision arrives.
+    Suppress,
+    /// A create rejected for an expired token: refresh it and resubscribe.
+    Reauth,
 }
 
 /// Background task that keeps a watch alive across connection failures: it owns
@@ -695,9 +710,15 @@ struct WatchDriver {
     /// Watch ids whose `created` ack was already delivered, so the duplicate
     /// echoed after a reconnect replay is suppressed.
     seen_created: HashSet<i64>,
+    /// Creates sent on the current stream and not answered yet, in send order.
+    pending: VecDeque<PendingCreate>,
+    /// Fragments of a revision not complete yet, merged before delivery so a
+    /// replay after a mid-revision reconnect delivers no duplicates.
+    fragments: HashMap<i64, WatchResponse>,
     next_id: i64,
-    /// Consecutive reconnect attempts without an intervening response, used to
-    /// grow the reconnect backoff. Reset to 0 once the stream delivers again.
+    /// Consecutive reconnect attempts without a response delivered to the
+    /// caller, used to grow the reconnect backoff. Replayed `created` acks do
+    /// not count: a node can accept the stream and then drop it.
     reconnect_attempt: u32,
     req_rx: Receiver<WatchRequest>,
     out_tx: Sender<Result<WatchResponse>>,
@@ -730,13 +751,21 @@ impl WatchDriver {
                     None => req_open = false,
                 },
                 msg = stream.message() => match msg {
-                    Ok(Some(resp)) => {
-                        // A delivered response proves the stream is healthy.
-                        self.reconnect_attempt = 0;
-                        if self.forward(WatchResponse::new(resp)).await.is_err() {
-                            return;
+                    Ok(Some(resp)) => match self.forward(WatchResponse::new(resp)).await {
+                        // Only a response the caller receives proves the stream healthy.
+                        Ok(Delivery::Forward) => self.reconnect_attempt = 0,
+                        Ok(Delivery::Suppress) => {}
+                        // The token travels with the stream, so a fresh one needs a
+                        // fresh stream: refresh, then resubscribe every watch.
+                        Ok(Delivery::Reauth) => {
+                            let _ = self.client.inner.refresh_token().await;
+                            match self.reconnect().await {
+                                Some((s, st)) => { sender = s; stream = st; }
+                                None => return,
+                            }
                         }
-                    }
+                        Err(()) => return,
+                    },
                     Ok(None) | Err(_) => match self.reconnect().await {
                         Some((s, st)) => { sender = s; stream = st; }
                         None => return,
@@ -752,14 +781,20 @@ impl WatchDriver {
         match req.request_union {
             Some(WatchRequestUnion::CreateRequest(mut create)) => {
                 let id = assign_watch_id(&mut create, &mut self.next_id, &self.watches);
-                let from_now = create.start_revision == 0;
-                self.watches.insert(
-                    id,
-                    WatchState {
-                        create_req: create.clone(),
-                        from_now,
-                    },
-                );
+                // A caller-chosen id of a live watch is rejected by the server,
+                // so it must not replace that watch's registration.
+                let registered = match self.watches.entry(id) {
+                    Entry::Occupied(_) => false,
+                    Entry::Vacant(slot) => {
+                        slot.insert(WatchState {
+                            create_req: create.clone(),
+                            from_now: create.start_revision == 0,
+                            reauthed: false,
+                        });
+                        true
+                    }
+                };
+                self.pending.push_back(PendingCreate { id, registered });
                 create.into()
             }
             Some(WatchRequestUnion::CancelRequest(cancel)) => {
@@ -774,36 +809,84 @@ impl WatchDriver {
         }
     }
 
-    /// Forward a response, updating the watch's resume revision. Returns `Err`
-    /// when the caller has dropped the response stream.
-    async fn forward(&mut self, resp: WatchResponse) -> std::result::Result<(), ()> {
-        if !Self::record(&mut self.watches, &mut self.seen_created, &resp) {
-            return Ok(());
+    /// Update the registry for `resp` and forward it unless the registry says
+    /// otherwise. Returns `Err` when the caller has dropped the response stream.
+    async fn forward(&mut self, resp: WatchResponse) -> std::result::Result<Delivery, ()> {
+        let Some(resp) = Self::merge_fragments(&mut self.fragments, resp) else {
+            return Ok(Delivery::Suppress);
+        };
+        let delivery = Self::record(
+            &mut self.watches,
+            &mut self.seen_created,
+            &mut self.pending,
+            &resp,
+        );
+        if delivery == Delivery::Forward {
+            self.out_tx.send(Ok(resp)).await.map_err(|_| ())?;
         }
-        self.out_tx.send(Ok(resp)).await.map_err(|_| ())
+        Ok(delivery)
     }
 
-    /// Update the registry for `resp` and report whether it should reach the
-    /// caller. Returns `false` to suppress a duplicate `created` ack echoed
-    /// after a reconnect replay. Pure over the two maps so it is unit-testable.
+    /// Holds a non-final fragment and returns `None`, or returns the complete
+    /// response once the final fragment of its revision arrives. A held
+    /// fragment never reaches `record`, so the resume point stays put.
+    fn merge_fragments(
+        fragments: &mut HashMap<i64, WatchResponse>,
+        mut resp: WatchResponse,
+    ) -> Option<WatchResponse> {
+        let id = resp.watch_id();
+        if resp.0.fragment {
+            match fragments.entry(id) {
+                Entry::Occupied(mut head) => head.get_mut().0.events.append(&mut resp.0.events),
+                Entry::Vacant(slot) => {
+                    slot.insert(resp);
+                }
+            }
+            return None;
+        }
+        let Some(mut head) = fragments.remove(&id) else {
+            return Some(resp);
+        };
+        head.0.events.append(&mut resp.0.events);
+        head.0.header = resp.0.header;
+        head.0.fragment = false;
+        Some(head)
+    }
+
+    /// Update the registry for `resp` and decide what to do with it. Pure over
+    /// the registry so it is unit-testable.
     fn record(
         watches: &mut HashMap<i64, WatchState>,
         seen_created: &mut HashSet<i64>,
+        pending: &mut VecDeque<PendingCreate>,
         resp: &WatchResponse,
-    ) -> bool {
-        let id = resp.watch_id();
+    ) -> Delivery {
         let header_rev = resp.header().map(|h| h.revision()).unwrap_or(0);
 
         if resp.created() {
-            // A create the server rejects (denied or invalid range) comes back
-            // as created and canceled together. Drop it so a reconnect does not
-            // replay a doomed create forever, and still forward it so the caller
-            // sees the cancel reason.
+            // A rejection carries `watch_id = -1`, so the create it answers is
+            // the oldest one pending, not the one its id names.
+            let PendingCreate { id, registered } = pending.pop_front().unwrap_or(PendingCreate {
+                id: resp.watch_id(),
+                registered: true,
+            });
             if resp.canceled() || resp.compact_revision() != 0 {
+                if !registered {
+                    return Delivery::Forward;
+                }
+                if crate::failover::is_auth_token_message(resp.cancel_reason()) {
+                    if let Some(ws) = watches.get_mut(&id).filter(|ws| !ws.reauthed) {
+                        ws.reauthed = true;
+                        return Delivery::Reauth;
+                    }
+                }
+                // Drop it so a reconnect does not replay a doomed create
+                // forever, and still forward it so the caller sees the reason.
                 watches.remove(&id);
                 seen_created.remove(&id);
             } else if seen_created.insert(id) {
                 if let Some(ws) = watches.get_mut(&id) {
+                    ws.reauthed = false;
                     // etcd binds a from-now watch at header+1, so resuming there
                     // reproduces the server's effective start without replaying
                     // the pre-watch event at `header`.
@@ -812,10 +895,17 @@ impl WatchDriver {
                     }
                 }
             } else {
+                if let Some(ws) = watches.get_mut(&id) {
+                    ws.reauthed = false;
+                }
                 // Duplicate created ack echoed after a reconnect replay.
-                return false;
+                return Delivery::Suppress;
             }
-        } else if resp.canceled() || resp.compact_revision() != 0 {
+            return Delivery::Forward;
+        }
+
+        let id = resp.watch_id();
+        if resp.canceled() || resp.compact_revision() != 0 {
             watches.remove(&id);
             seen_created.remove(&id);
         } else if id == INVALID_WATCH_ID {
@@ -828,30 +918,26 @@ impl WatchDriver {
                 }
             }
         } else if let Some(ws) = watches.get_mut(&id) {
-            // Hold the resume point on a non-final fragment: the rest of the
-            // revision arrives in later fragments and resuming past it would
-            // skip them.
-            if !resp.0.fragment {
-                // Events carry the highest revision in this batch. A per-watch
-                // progress notification (no events) advances to the header.
-                let last_event_rev = resp
-                    .events()
-                    .last()
-                    .and_then(|e| e.kv().map(|kv| kv.mod_revision()));
-                let new_start = last_event_rev.map_or(header_rev + 1, |r| r + 1);
-                if new_start > ws.create_req.start_revision {
-                    ws.create_req.start_revision = new_start;
-                }
+            // Fragments are merged before `record`, so this is a whole revision.
+            // Events carry the highest revision in this batch. A per-watch
+            // progress notification (no events) advances to the header.
+            let last_event_rev = resp
+                .events()
+                .last()
+                .and_then(|e| e.kv().map(|kv| kv.mod_revision()));
+            let new_start = last_event_rev.map_or(header_rev + 1, |r| r + 1);
+            if new_start > ws.create_req.start_revision {
+                ws.create_req.start_revision = new_start;
             }
         }
-        true
+        Delivery::Forward
     }
 
     /// Re-establish the stream and replay active watches from their resume
     /// revision. Returns `None` to stop the driver: the caller gave up, or no
     /// active watches remain to resubscribe.
     async fn reconnect(&mut self) -> Option<(Sender<WatchRequest>, Streaming<PbWatchResponse>)> {
-        use crate::failover::{classify, Decision, RetryPolicy};
+        use crate::failover::{classify, Decision};
         loop {
             if self.out_tx.is_closed() || self.watches.is_empty() {
                 return None;
@@ -870,18 +956,33 @@ impl WatchDriver {
             let wait = self.retry.reconnect_backoff(self.reconnect_attempt);
             self.reconnect_attempt = self.reconnect_attempt.saturating_add(1);
             tokio::time::sleep(wait).await;
+            // The old stream's answers are gone: the replayed creates are the
+            // only pending ones, and a half-received revision is replayed whole.
+            self.pending.clear();
+            self.fragments.clear();
             let initial: Vec<WatchRequest> = self
                 .watches
-                .values()
-                .map(|ws| ws.create_req.clone().into())
+                .iter()
+                .map(|(&id, ws)| {
+                    self.pending.push_back(PendingCreate {
+                        id,
+                        registered: true,
+                    });
+                    ws.create_req.clone().into()
+                })
                 .collect();
-            match self.client.watch_raw(initial).await {
+            let e = match self.client.watch_raw(initial).await {
                 Ok(pair) => return Some(pair),
-                // A permanent error (e.g. an expired auth token the driver
-                // cannot refresh) would otherwise retry forever as a silent
-                // hang. Surface it and stop so the caller can rebuild through
-                // Client.
-                Err(e) if !matches!(classify(&e, RetryPolicy::Repeatable), Decision::Retry) => {
+                Err(e) => e,
+            };
+            match classify(&e, RetryPolicy::Repeatable) {
+                Decision::Retry => {}
+                Decision::RefreshToken if self.client.inner.has_creds() => {
+                    let _ = self.client.inner.refresh_token().await;
+                }
+                // A permanent error would otherwise retry forever as a silent
+                // hang. Surface it and stop so the caller can rebuild.
+                _ => {
                     tracing::warn!(
                         target: "etcd_client::failover",
                         error = %e,
@@ -890,7 +991,6 @@ impl WatchDriver {
                     let _ = self.out_tx.send(Err(e)).await;
                     return None;
                 }
-                Err(_) => {}
             }
         }
     }
@@ -909,6 +1009,7 @@ mod driver_tests {
                 ..Default::default()
             },
             from_now,
+            reauthed: false,
         }
     }
 
@@ -929,12 +1030,113 @@ mod driver_tests {
         }
     }
 
+    /// Records `pb` with every watch not acked yet pending, in id order, which
+    /// is the order the driver sent their creates in these tests.
     fn record(
         watches: &mut HashMap<i64, WatchState>,
         seen: &mut HashSet<i64>,
         pb: PbWatchResponse,
     ) -> bool {
-        WatchDriver::record(watches, seen, &WatchResponse(pb))
+        let mut ids: Vec<i64> = watches
+            .keys()
+            .filter(|id| !seen.contains(id))
+            .copied()
+            .collect();
+        ids.sort_unstable();
+        let mut pending = ids
+            .into_iter()
+            .map(|id| PendingCreate {
+                id,
+                registered: true,
+            })
+            .collect();
+        WatchDriver::record(watches, seen, &mut pending, &WatchResponse(pb)) == Delivery::Forward
+    }
+
+    fn rejection(reason: &str) -> WatchResponse {
+        WatchResponse(PbWatchResponse {
+            watch_id: INVALID_WATCH_ID,
+            created: true,
+            canceled: true,
+            cancel_reason: reason.into(),
+            header: header(5),
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn rejected_create_with_invalid_id_drops_the_pending_watch() {
+        // etcd rejects a create (duplicate id, empty range) with
+        // `watch_id = InvalidWatchID`, not the requested id. The rejection must
+        // still retire the pending create, otherwise it is replayed on every
+        // reconnect and the driver never runs out of watches.
+        let mut watches = HashMap::from([(1, ws(false, 7)), (2, ws(false, 0))]);
+        let mut seen = HashSet::from([1]);
+        let forwarded = record(
+            &mut watches,
+            &mut seen,
+            PbWatchResponse {
+                watch_id: INVALID_WATCH_ID,
+                created: true,
+                canceled: true,
+                cancel_reason: "mvcc: watcher range is empty".into(),
+                header: header(5),
+                ..Default::default()
+            },
+        );
+        assert!(forwarded, "caller must see the rejection");
+        assert!(
+            !watches.contains_key(&2),
+            "rejected pending create must not be replayed on reconnect"
+        );
+        assert!(
+            watches.contains_key(&1),
+            "an already-acked watch must survive another create's rejection"
+        );
+    }
+
+    #[test]
+    fn rejected_duplicate_id_keeps_the_live_watch() {
+        let mut watches = HashMap::from([(1, ws(false, 7))]);
+        let mut seen = HashSet::from([1]);
+        let mut pending = VecDeque::from([PendingCreate {
+            id: 1,
+            registered: false,
+        }]);
+        let delivery = WatchDriver::record(
+            &mut watches,
+            &mut seen,
+            &mut pending,
+            &rejection("mvcc: duplicate watch ID provided on the WatchStream"),
+        );
+        assert_eq!(delivery, Delivery::Forward);
+        assert_eq!(watches[&1].create_req.start_revision, 7);
+        assert!(seen.contains(&1));
+    }
+
+    #[test]
+    fn token_rejection_reauths_once_then_drops() {
+        let reason = "rpc error: code = Unauthenticated desc = etcdserver: invalid auth token";
+        let mut watches = HashMap::from([(1, ws(false, 7))]);
+        let mut seen = HashSet::from([1]);
+        let pending = || {
+            VecDeque::from([PendingCreate {
+                id: 1,
+                registered: true,
+            }])
+        };
+        let first =
+            WatchDriver::record(&mut watches, &mut seen, &mut pending(), &rejection(reason));
+        assert_eq!(first, Delivery::Reauth);
+        assert!(watches.contains_key(&1), "kept for the resubscribe");
+        let second =
+            WatchDriver::record(&mut watches, &mut seen, &mut pending(), &rejection(reason));
+        assert_eq!(
+            second,
+            Delivery::Forward,
+            "a refreshed token still rejected is final"
+        );
+        assert!(watches.is_empty());
     }
 
     #[test]
@@ -1025,24 +1227,24 @@ mod driver_tests {
     }
 
     #[test]
-    fn non_final_fragment_holds_resume() {
-        let mut watches = HashMap::from([(1, ws(false, 0))]);
-        let mut seen = HashSet::from([1]);
-        record(
-            &mut watches,
-            &mut seen,
-            PbWatchResponse {
+    fn fragments_merge_into_one_delivery() {
+        let mut fragments = HashMap::new();
+        let fragment = |mod_revision, fragment| {
+            WatchResponse(PbWatchResponse {
                 watch_id: 1,
-                header: header(20),
-                fragment: true,
-                events: vec![event(20)],
+                header: header(9),
+                events: vec![event(mod_revision)],
+                fragment,
                 ..Default::default()
-            },
-        );
-        assert_eq!(
-            watches[&1].create_req.start_revision, 0,
-            "resume must not advance on a non-final fragment"
-        );
+            })
+        };
+        let mut merge = |resp| WatchDriver::merge_fragments(&mut fragments, resp);
+        assert!(merge(fragment(9, true)).is_none());
+        assert!(merge(fragment(9, true)).is_none());
+        let merged = merge(fragment(9, false)).expect("final fragment");
+        assert_eq!(merged.events().len(), 3);
+        assert!(!merged.0.fragment);
+        assert!(fragments.is_empty());
     }
 
     #[test]

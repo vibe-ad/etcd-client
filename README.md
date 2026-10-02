@@ -101,7 +101,11 @@ etcd-client = { version = "0.19", features = ["failover"] }
   *write-at-most-once*: a failed write is never silently applied twice.
 - **Streaming reconnection.** A broken watch stream re-establishes on a healthy
   endpoint and resumes each watch from the revision after the last one delivered.
-  A broken lease keep-alive stream re-establishes and resumes renewals.
+  A watch rejected for an expired token is resubscribed with a refreshed one,
+  and fragments of a revision are delivered merged, so a mid-revision reconnect
+  delivers no duplicates. A broken lease keep-alive stream re-establishes and
+  resumes renewals. A node that silently drops traffic never breaks a stream,
+  so pair streams with `ConnectOptions::with_keep_alive`.
 - **Auth token refresh.** An expired auth token is refreshed and the call
   retried, mirroring Go `clientv3`. This is unconditional under `failover`,
   so `ConnectOptions::with_auto_token_refresh` is ignored: enabling it would

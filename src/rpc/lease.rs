@@ -28,7 +28,7 @@ type Client = PbLeaseClient<InterceptedChannel>;
 #[cfg(feature = "failover")]
 use crate::failover::RetryConfig;
 #[cfg(feature = "failover")]
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 #[cfg(feature = "failover")]
 use tokio::sync::mpsc::Receiver;
 
@@ -109,7 +109,10 @@ impl LeaseClient {
         // Eagerly open, failing over across endpoints: the single-shot open can
         // land on a down node.
         #[cfg(feature = "failover")]
-        let (sender, mut stream) = self.open_retrying(vec![req]).await?;
+        let (sender, mut stream) = self
+            .inner
+            .do_call(RetryPolicy::Repeatable, vec![req], open_keep_alive)
+            .await?;
         #[cfg(not(feature = "failover"))]
         let (sender, mut stream) = self.keep_alive_raw(vec![req]).await?;
 
@@ -136,6 +139,7 @@ impl LeaseClient {
                 client: self.clone(),
                 retry: self.retry.clone(),
                 lease_ids: HashSet::from([id]),
+                owed: HashMap::new(),
                 reconnect_attempt: 0,
                 req_rx: driver_rx,
                 out_tx,
@@ -153,8 +157,8 @@ impl LeaseClient {
         ))
     }
 
-    /// Open a fresh gRPC keep-alive stream with `initial` requests queued before
-    /// the stream is established.
+    /// Open a fresh gRPC keep-alive stream with `initial` requests queued, in a
+    /// single attempt.
     async fn keep_alive_raw(
         &mut self,
         initial: Vec<PbLeaseKeepAliveRequest>,
@@ -162,59 +166,7 @@ impl LeaseClient {
         Sender<PbLeaseKeepAliveRequest>,
         Streaming<PbLeaseKeepAliveResponse>,
     )> {
-        async fn keep_alive_impl(
-            client: &mut Client,
-            initial: Vec<PbLeaseKeepAliveRequest>,
-        ) -> Result<(
-            Sender<PbLeaseKeepAliveRequest>,
-            Streaming<PbLeaseKeepAliveResponse>,
-        )> {
-            let (tx, rx) = channel::<PbLeaseKeepAliveRequest>(100);
-            for req in initial {
-                tx.send(req)
-                    .await
-                    .map_err(|e| Error::LeaseKeepAliveError(e.to_string()))?;
-            }
-            let stream = client
-                .lease_keep_alive(ReceiverStream::new(rx))
-                .await?
-                .into_inner();
-            Ok((tx, stream))
-        }
-        self.inner.do_call_once(initial, keep_alive_impl).await
-    }
-
-    /// Open the initial keep-alive stream, failing over to a healthy endpoint on
-    /// a transient error. The balancer can route the single-shot open to a down
-    /// node, so retry it like a repeatable unary RPC (quorum-paced backoff,
-    /// bounded by the retry budget so a total outage still errors).
-    #[cfg(feature = "failover")]
-    async fn open_retrying(
-        &mut self,
-        initial: Vec<PbLeaseKeepAliveRequest>,
-    ) -> Result<(
-        Sender<PbLeaseKeepAliveRequest>,
-        Streaming<PbLeaseKeepAliveResponse>,
-    )> {
-        use crate::failover::{classify, Decision, RetryPolicy};
-        let max = self.retry.max_attempts.max(1);
-        let mut last = None;
-        for attempt in 0..max {
-            let wait = self.retry.backoff(attempt);
-            if !wait.is_zero() {
-                tokio::time::sleep(wait).await;
-            }
-            match self.keep_alive_raw(initial.clone()).await {
-                Ok(pair) => return Ok(pair),
-                Err(e) => match classify(&e, RetryPolicy::Repeatable) {
-                    Decision::Retry => last = Some(e),
-                    // The sub-client cannot refresh a token, so an auth error
-                    // here is terminal rather than worth burning the budget on.
-                    Decision::Stop | Decision::RefreshToken => return Err(e),
-                },
-            }
-        }
-        Err(last.expect("retry budget runs at least once"))
+        self.inner.do_call_once(initial, open_keep_alive).await
     }
 
     /// Retrieves lease information.
@@ -260,6 +212,28 @@ impl LeaseClient {
             )
             .await
     }
+}
+
+/// Open a gRPC keep-alive stream with `initial` requests queued before the
+/// stream is established.
+async fn open_keep_alive(
+    client: &mut Client,
+    initial: Vec<PbLeaseKeepAliveRequest>,
+) -> Result<(
+    Sender<PbLeaseKeepAliveRequest>,
+    Streaming<PbLeaseKeepAliveResponse>,
+)> {
+    let (tx, rx) = channel::<PbLeaseKeepAliveRequest>(100);
+    for req in initial {
+        tx.send(req)
+            .await
+            .map_err(|e| Error::LeaseKeepAliveError(e.to_string()))?;
+    }
+    let stream = client
+        .lease_keep_alive(ReceiverStream::new(rx))
+        .await?
+        .into_inner();
+    Ok((tx, stream))
 }
 
 /// Options for `Grant` operation.
@@ -740,8 +714,14 @@ struct LeaseKeepAliveDriver {
     client: LeaseClient,
     retry: RetryConfig,
     lease_ids: HashSet<i64>,
-    /// Consecutive reconnect attempts without an intervening response, used to
-    /// grow the reconnect backoff. Reset to 0 once the stream delivers again.
+    /// Caller keep-alives not answered yet, per lease. A request lost with a
+    /// broken stream is re-sent on reconnect, and a response nobody waits for
+    /// (the re-prime of an idle lease) is dropped, so each `keep_alive` gets
+    /// exactly one response.
+    owed: HashMap<i64, u32>,
+    /// Consecutive reconnect attempts without a response delivered to the
+    /// caller, used to grow the reconnect backoff. The answer to a re-prime does
+    /// not count: a node can accept the stream and then drop it.
     reconnect_attempt: u32,
     req_rx: Receiver<PbLeaseKeepAliveRequest>,
     out_tx: Sender<Result<LeaseKeepAliveResponse>>,
@@ -762,6 +742,7 @@ impl LeaseKeepAliveDriver {
                 r = self.req_rx.recv(), if req_open => match r {
                     Some(req) => {
                         self.lease_ids.insert(req.id);
+                        *self.owed.entry(req.id).or_default() += 1;
                         if sender.send(req).await.is_err() {
                             match self.reconnect().await {
                                 Some((s, st)) => { sender = s; stream = st; }
@@ -773,14 +754,24 @@ impl LeaseKeepAliveDriver {
                 },
                 msg = stream.message() => match msg {
                     Ok(Some(resp)) => {
-                        // A delivered response proves the stream is healthy.
-                        self.reconnect_attempt = 0;
                         let resp = LeaseKeepAliveResponse::new(resp);
+                        let owed = match self.owed.get_mut(&resp.id()) {
+                            Some(n) if *n > 0 => {
+                                *n -= 1;
+                                true
+                            }
+                            _ => false,
+                        };
                         // A ttl<=0 response means the lease is gone: stop tracking
                         // it, but still deliver the response so the caller sees it.
                         if resp.ttl() <= 0 {
                             self.lease_ids.remove(&resp.id());
+                            self.owed.remove(&resp.id());
+                        } else if !owed {
+                            continue;
                         }
+                        // Only a response the caller receives proves the stream healthy.
+                        self.reconnect_attempt = 0;
                         if self.out_tx.send(Ok(resp)).await.is_err() {
                             return;
                         }
@@ -805,7 +796,7 @@ impl LeaseKeepAliveDriver {
         Sender<PbLeaseKeepAliveRequest>,
         Streaming<PbLeaseKeepAliveResponse>,
     )> {
-        use crate::failover::{classify, Decision, RetryPolicy};
+        use crate::failover::{classify, Decision};
         loop {
             if self.out_tx.is_closed() || self.lease_ids.is_empty() {
                 return None;
@@ -824,18 +815,28 @@ impl LeaseKeepAliveDriver {
             let wait = self.retry.reconnect_backoff(self.reconnect_attempt);
             self.reconnect_attempt = self.reconnect_attempt.saturating_add(1);
             tokio::time::sleep(wait).await;
+            // Re-send every keep-alive lost with the old stream, and prime idle
+            // leases with one so they resume renewing.
             let initial: Vec<PbLeaseKeepAliveRequest> = self
                 .lease_ids
                 .iter()
-                .map(|&id| PbLeaseKeepAliveRequest { id })
+                .flat_map(|&id| {
+                    let owed = self.owed.get(&id).copied().unwrap_or(0).max(1);
+                    std::iter::repeat(PbLeaseKeepAliveRequest { id }).take(owed as usize)
+                })
                 .collect();
-            match self.client.keep_alive_raw(initial).await {
+            let e = match self.client.keep_alive_raw(initial).await {
                 Ok(pair) => return Some(pair),
-                // A permanent error (e.g. an expired auth token the driver
-                // cannot refresh) would otherwise retry forever as a silent
-                // hang. Surface it and stop so the caller can rebuild through
-                // Client.
-                Err(e) if !matches!(classify(&e, RetryPolicy::Repeatable), Decision::Retry) => {
+                Err(e) => e,
+            };
+            match classify(&e, RetryPolicy::Repeatable) {
+                Decision::Retry => {}
+                Decision::RefreshToken if self.client.inner.has_creds() => {
+                    let _ = self.client.inner.refresh_token().await;
+                }
+                // A permanent error would otherwise retry forever as a silent
+                // hang. Surface it and stop so the caller can rebuild.
+                _ => {
                     tracing::warn!(
                         target: "etcd_client::failover",
                         error = %e,
@@ -844,7 +845,6 @@ impl LeaseKeepAliveDriver {
                     let _ = self.out_tx.send(Err(e)).await;
                     return None;
                 }
-                Err(_) => {}
             }
         }
     }

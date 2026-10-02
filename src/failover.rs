@@ -9,9 +9,11 @@
 //! reached a server, preserving write-at-most-once.
 
 use crate::error::Error;
+use crate::lock::MutexExt;
+use http::Uri;
+use std::collections::HashSet;
 use std::error::Error as StdError;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tonic::{Code, Status};
 
@@ -27,15 +29,17 @@ pub(crate) enum Decision {
 /// Failover tuning, derived from `ConnectOptions`. Cheap to clone.
 #[derive(Clone)]
 pub(crate) struct RetryConfig {
-    /// Total attempts including the first. `<= 1` disables retry.
-    pub(crate) max_attempts: u32,
+    /// Total attempts including the first, when set by `with_retries`. `None`
+    /// derives the budget from the live endpoint count.
+    fixed_max_attempts: Option<u32>,
     /// Base wait between retry rounds.
     backoff_wait: Duration,
     /// Jitter as a fraction of `backoff_wait` (e.g. 0.10 for +/-10%).
     jitter: f64,
-    /// Live endpoint count, used to pace backoff by quorum. Shared with every
-    /// clone so `add_endpoint` / `remove_endpoint` re-pace the whole client.
-    endpoint_count: Arc<AtomicUsize>,
+    /// Live endpoints, keyed like the balancer so a repeated add or a remove of
+    /// an unknown URI leaves the count unchanged. Shared with every clone so
+    /// `add_endpoint` / `remove_endpoint` re-pace the whole client.
+    endpoints: Arc<Mutex<HashSet<Uri>>>,
     /// Auto-reconnect a broken watch stream, resuming from the last revision.
     pub(crate) watch_reconnect: bool,
     /// Auto-reconnect a broken lease keep-alive stream.
@@ -44,18 +48,18 @@ pub(crate) struct RetryConfig {
 
 impl RetryConfig {
     pub(crate) fn new(
-        max_attempts: u32,
+        fixed_max_attempts: Option<u32>,
         backoff_wait: Duration,
         jitter: f64,
-        endpoint_count: usize,
+        endpoints: impl IntoIterator<Item = Uri>,
         watch_reconnect: bool,
         lease_reconnect: bool,
     ) -> Self {
         Self {
-            max_attempts,
+            fixed_max_attempts,
             backoff_wait,
             jitter,
-            endpoint_count: Arc::new(AtomicUsize::new(endpoint_count.max(1))),
+            endpoints: Arc::new(Mutex::new(endpoints.into_iter().collect())),
             watch_reconnect,
             lease_reconnect,
         }
@@ -63,7 +67,18 @@ impl RetryConfig {
 
     /// A config with retry effectively disabled (single attempt).
     pub(crate) fn disabled() -> Self {
-        Self::new(1, Duration::from_millis(25), 0.10, 1, false, false)
+        Self::new(Some(1), Duration::from_millis(25), 0.10, [], false, false)
+    }
+
+    /// Live endpoint count, at least one: a raw channel manages no endpoints.
+    fn endpoint_count(&self) -> usize {
+        self.endpoints.lock_unpoisoned().len().max(1)
+    }
+
+    /// Total attempts per unary RPC, including the first. `<= 1` disables retry.
+    pub(crate) fn max_attempts(&self) -> u32 {
+        self.fixed_max_attempts
+            .unwrap_or_else(|| (2 * self.endpoint_count()).max(5) as u32)
     }
 
     /// Backoff before `attempt` (0-indexed). Mirrors etcd's
@@ -73,7 +88,7 @@ impl RetryConfig {
         if attempt == 0 {
             return Duration::ZERO;
         }
-        let quorum = (self.endpoint_count.load(Ordering::Relaxed) / 2 + 1) as u32;
+        let quorum = (self.endpoint_count() / 2 + 1) as u32;
         if attempt % quorum == 0 {
             jittered(self.backoff_wait, self.jitter)
         } else {
@@ -81,19 +96,14 @@ impl RetryConfig {
         }
     }
 
-    /// Tracks a successful `add_endpoint`, so backoff paces against the live
-    /// endpoint count. `max_attempts` stays as derived at connect time.
-    pub(crate) fn endpoint_added(&self) {
-        self.endpoint_count.fetch_add(1, Ordering::Relaxed);
+    /// Tracks a successful `add_endpoint`.
+    pub(crate) fn endpoint_added(&self, uri: Uri) {
+        self.endpoints.lock_unpoisoned().insert(uri);
     }
 
-    /// Tracks a successful `remove_endpoint`, never dropping below one.
-    pub(crate) fn endpoint_removed(&self) {
-        let _ = self
-            .endpoint_count
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                (n > 1).then(|| n - 1)
-            });
+    /// Tracks a successful `remove_endpoint`.
+    pub(crate) fn endpoint_removed(&self, uri: &Uri) {
+        self.endpoints.lock_unpoisoned().remove(uri);
     }
 
     /// Backoff for a stream reconnect attempt: exponential from `backoff_wait`,
@@ -147,7 +157,12 @@ pub(crate) fn classify(err: &Error, policy: RetryPolicy) -> Decision {
 /// etcd server messages that mean the auth token should be refreshed and the
 /// call retried (see `rpctypes` in etcd).
 fn is_auth_token_error(status: &Status) -> bool {
-    let msg = status.message();
+    is_auth_token_message(status.message())
+}
+
+/// Message form of [`is_auth_token_error`], for a watch create the server
+/// rejects with the token error in `cancel_reason`.
+pub(crate) fn is_auth_token_message(msg: &str) -> bool {
     msg.contains("invalid auth token")
         || msg.contains("revision of auth store is old")
         || msg.contains("user name is empty")
@@ -344,9 +359,25 @@ mod tests {
         assert!(!is_not_sent(&reset));
     }
 
+    fn uri(port: u16) -> Uri {
+        format!("http://127.0.0.1:{port}").parse().unwrap()
+    }
+
+    fn config(max_attempts: Option<u32>, endpoints: u16) -> RetryConfig {
+        let uris = (0..endpoints).map(|i| uri(2379 + i));
+        RetryConfig::new(
+            max_attempts,
+            Duration::from_millis(25),
+            0.0,
+            uris,
+            true,
+            true,
+        )
+    }
+
     #[test]
     fn backoff_paces_by_quorum() {
-        let cfg = RetryConfig::new(10, Duration::from_millis(25), 0.0, 3, true, true);
+        let cfg = config(Some(10), 3);
         assert_eq!(cfg.backoff(0), Duration::ZERO);
         assert_eq!(cfg.backoff(1), Duration::ZERO);
         assert_eq!(cfg.backoff(2), Duration::from_millis(25));
@@ -356,7 +387,7 @@ mod tests {
     #[test]
     fn single_endpoint_backs_off_every_retry() {
         // quorum is 1, so every attempt past the first pauses.
-        let cfg = RetryConfig::new(5, Duration::from_millis(25), 0.0, 1, false, false);
+        let cfg = config(Some(5), 1);
         assert_eq!(cfg.backoff(0), Duration::ZERO);
         assert_eq!(cfg.backoff(1), Duration::from_millis(25));
         assert_eq!(cfg.backoff(2), Duration::from_millis(25));
@@ -364,7 +395,7 @@ mod tests {
 
     #[test]
     fn reconnect_backoff_grows_then_caps() {
-        let cfg = RetryConfig::new(10, Duration::from_millis(25), 0.0, 1, true, true);
+        let cfg = config(Some(10), 1);
         assert_eq!(cfg.reconnect_backoff(0), Duration::from_millis(25));
         assert_eq!(cfg.reconnect_backoff(1), Duration::from_millis(50));
         assert_eq!(cfg.reconnect_backoff(2), Duration::from_millis(100));
@@ -375,32 +406,49 @@ mod tests {
 
     #[test]
     fn backoff_tracks_live_endpoint_count() {
-        let cfg = RetryConfig::new(10, Duration::from_millis(25), 0.0, 1, false, false);
+        let cfg = config(Some(10), 1);
         // Quorum of 1: every retry pauses.
         assert_eq!(cfg.backoff(1), Duration::from_millis(25));
-        cfg.endpoint_added();
-        cfg.endpoint_added();
+        cfg.endpoint_added(uri(3000));
+        cfg.endpoint_added(uri(3001));
         // Quorum of 2: the odd attempts sweep, the even ones pause.
         assert_eq!(cfg.backoff(1), Duration::ZERO);
         assert_eq!(cfg.backoff(2), Duration::from_millis(25));
-        cfg.endpoint_removed();
-        cfg.endpoint_removed();
-        // Clamped at one, so the pacing is back to pausing on every retry.
-        cfg.endpoint_removed();
+        cfg.endpoint_removed(&uri(3000));
+        cfg.endpoint_removed(&uri(3001));
         assert_eq!(cfg.backoff(1), Duration::from_millis(25));
     }
 
     #[test]
-    fn endpoint_count_is_shared_across_clones() {
-        let cfg = RetryConfig::new(10, Duration::from_millis(25), 0.0, 1, false, false);
+    fn repeated_add_and_unknown_remove_leave_the_count_alone() {
+        let cfg = config(None, 3);
+        cfg.endpoint_added(uri(2379));
+        cfg.endpoint_removed(&uri(4000));
+        assert_eq!(cfg.endpoint_count(), 3);
+    }
+
+    #[test]
+    fn derived_budget_follows_the_live_endpoint_count() {
+        let cfg = config(None, 3);
+        assert_eq!(cfg.max_attempts(), 6);
+        for port in 3000..3002 {
+            cfg.endpoint_added(uri(port));
+        }
+        assert_eq!(cfg.max_attempts(), 10);
+        assert_eq!(config(Some(3), 5).max_attempts(), 3);
+    }
+
+    #[test]
+    fn endpoint_set_is_shared_across_clones() {
+        let cfg = config(Some(10), 1);
         let clone = cfg.clone();
-        cfg.endpoint_added();
-        cfg.endpoint_added();
+        cfg.endpoint_added(uri(3000));
+        cfg.endpoint_added(uri(3001));
         assert_eq!(clone.backoff(1), Duration::ZERO);
     }
 
     #[test]
     fn disabled_config_is_single_attempt() {
-        assert_eq!(RetryConfig::disabled().max_attempts, 1);
+        assert_eq!(RetryConfig::disabled().max_attempts(), 1);
     }
 }

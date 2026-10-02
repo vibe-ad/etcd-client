@@ -152,14 +152,30 @@ impl<T> ClientCaller<T> {
 
     /// Refresh the authentication token if the client has credentials options.
     pub async fn refresh_token(&self) -> Result<()> {
+        self.refresh_token_within(self.authenticate_attempts())
+            .await
+    }
+
+    /// Refreshes with at most `attempts` authenticate calls. The `do_call` loop
+    /// refreshes with one, so its own budget bounds the reauth and the two
+    /// retry loops do not multiply.
+    async fn refresh_token_within(&self, attempts: u32) -> Result<()> {
         let creds = self.options.creds.read_unpoisoned().clone();
         if let Some((user, password)) = creds {
-            let token = self.do_authenticate(user, password).await?;
+            let token = self.do_authenticate(user, password, attempts).await?;
             self.auth_token.write_unpoisoned().replace(token);
         } else {
             let _ = self.auth_token.write_unpoisoned().take();
         }
         Ok(())
+    }
+
+    /// The authenticate budget: the failover budget, or a single attempt.
+    fn authenticate_attempts(&self) -> u32 {
+        #[cfg(feature = "failover")]
+        return self.retry.max_attempts();
+        #[cfg(not(feature = "failover"))]
+        1
     }
 
     /// Update a user.
@@ -171,7 +187,9 @@ impl<T> ClientCaller<T> {
     /// If the user is `None`, it will remove the authentication token from the client.
     pub async fn update_user(&mut self, creds: Option<(String, String)>) -> Result<()> {
         if let Some((ref name, ref password)) = creds {
-            let token = self.do_authenticate(name.clone(), password.clone()).await?;
+            let token = self
+                .do_authenticate(name.clone(), password.clone(), self.authenticate_attempts())
+                .await?;
             self.auth_token.write_unpoisoned().replace(token);
         } else {
             let _ = self.auth_token.write_unpoisoned().take();
@@ -243,7 +261,7 @@ impl<T> ClientCaller<T> {
         #[cfg(feature = "failover")]
         {
             use crate::failover::{classify, Decision};
-            let max = self.retry.max_attempts.max(1);
+            let max = self.retry.max_attempts().max(1);
             let mut last = None;
             for attempt in 0..max {
                 let wait = self.retry.backoff(attempt);
@@ -259,7 +277,7 @@ impl<T> ClientCaller<T> {
                             if !self.has_creds() {
                                 return Err(e);
                             }
-                            tracing::warn!(
+                            tracing::info!(
                                 target: "etcd_client::failover",
                                 attempt = attempt + 1,
                                 max,
@@ -269,11 +287,11 @@ impl<T> ClientCaller<T> {
                             // Reauth is best-effort: a refresh that itself fails (for
                             // example it hit the down endpoint) must not mask the
                             // original error, so keep it and let the budget continue.
-                            let _ = self.refresh_token().await;
+                            let _ = self.refresh_token_within(1).await;
                             last = Some(e);
                         }
                         Decision::Retry => {
-                            tracing::warn!(
+                            tracing::info!(
                                 target: "etcd_client::failover",
                                 attempt = attempt + 1,
                                 max,
@@ -286,14 +304,23 @@ impl<T> ClientCaller<T> {
                     },
                 }
             }
-            Err(last.expect("retry loop runs at least once"))
+            let e = last.expect("retry loop runs at least once");
+            tracing::warn!(
+                target: "etcd_client::failover",
+                max,
+                error = %e,
+                "etcd unary RPC failed on every attempt",
+            );
+            Err(e)
         }
     }
 
+    #[cfg_attr(not(feature = "failover"), allow(unused_variables))]
     async fn do_authenticate(
         &self,
         user: String,
         password: String,
+        attempts: u32,
     ) -> Result<MetadataValue<Ascii>> {
         let req = AuthenticateOptions::new().with_user(user, password);
 
@@ -308,7 +335,7 @@ impl<T> ClientCaller<T> {
         #[cfg(feature = "failover")]
         let resp = {
             use crate::failover::{classify, Decision};
-            let max = self.retry.max_attempts.max(1);
+            let max = attempts.max(1);
             let mut last = None;
             let mut ok = None;
             for attempt in 0..max {
@@ -325,7 +352,7 @@ impl<T> ClientCaller<T> {
                         let e = crate::Error::from(status);
                         match classify(&e, RetryPolicy::Repeatable) {
                             Decision::Retry => {
-                                tracing::warn!(
+                                tracing::info!(
                                     target: "etcd_client::failover",
                                     attempt = attempt + 1,
                                     max,
@@ -341,7 +368,16 @@ impl<T> ClientCaller<T> {
             }
             match ok {
                 Some(resp) => resp,
-                None => return Err(last.expect("retry budget runs at least once")),
+                None => {
+                    let e = last.expect("retry budget runs at least once");
+                    tracing::warn!(
+                        target: "etcd_client::failover",
+                        max,
+                        error = %e,
+                        "etcd authenticate RPC failed on every attempt",
+                    );
+                    return Err(e);
+                }
             }
         };
 
