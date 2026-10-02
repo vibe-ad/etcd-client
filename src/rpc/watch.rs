@@ -1008,6 +1008,37 @@ mod driver_tests {
     }
 
     #[test]
+    fn rejected_create_with_invalid_id_drops_the_pending_watch() {
+        // etcd rejects a create (duplicate id, empty range) with
+        // `watch_id = InvalidWatchID`, not the requested id. The rejection must
+        // still retire the pending create, otherwise it is replayed on every
+        // reconnect and the driver never runs out of watches.
+        let mut watches = HashMap::from([(1, ws(false, 7)), (2, ws(false, 0))]);
+        let mut seen = HashSet::from([1]);
+        let forwarded = record(
+            &mut watches,
+            &mut seen,
+            PbWatchResponse {
+                watch_id: INVALID_WATCH_ID,
+                created: true,
+                canceled: true,
+                cancel_reason: "mvcc: watcher range is empty".into(),
+                header: header(5),
+                ..Default::default()
+            },
+        );
+        assert!(forwarded, "caller must see the rejection");
+        assert!(
+            !watches.contains_key(&2),
+            "rejected pending create must not be replayed on reconnect"
+        );
+        assert!(
+            watches.contains_key(&1),
+            "an already-acked watch must survive another create's rejection"
+        );
+    }
+
+    #[test]
     fn events_advance_resume_past_last_mod_revision() {
         let mut watches = HashMap::from([(1, ws(false, 0))]);
         let mut seen = HashSet::from([1]);

@@ -13,6 +13,8 @@ documentation = "https://docs.rs/etcd-client/"
 keywords = ["etcd", "v3", "api", "client", "async"]
 
 [features]
+# XXX(gwik): NOCOMMIT
+default = ["failover"]
 tls = ["tls-ring"]
 tls-ring = ["_tls", "tonic/tls-ring"]
 tls-aws-lc = ["_tls", "tonic/tls-aws-lc"]
